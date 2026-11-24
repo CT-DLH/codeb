@@ -50,6 +50,23 @@
     </section>
   </div>
 
+  <!-- 项目目录表：结构由 scan 自动生成，介绍由 LLM/agent 填写；这里只读 -->
+  <section class="card projtree-card">
+    <h2>项目目录表 <span class="hint">结构自动生成 · 介绍由 LLM/agent 填写，只读</span></h2>
+    <div class="pt-toolbar">
+      <div class="pt-repos" id="ptRepos"></div>
+      <div class="pt-filters" id="ptFilters">
+        <button data-filter="all" class="active">全部</button>
+        <button data-filter="stale">过期</button>
+        <button data-filter="missing">未写</button>
+        <button data-filter="noted">已写</button>
+      </div>
+      <input id="ptSearch" class="pt-search" type="search" placeholder="按路径 / 介绍筛选…">
+    </div>
+    <div class="pt-kpis" id="ptKpis"></div>
+    <div class="pt-tree" id="ptTree"><div class="loading">加载中…</div></div>
+  </section>
+
   <div class="grid lower">
     <section class="card">
       <h2>验证状态</h2>

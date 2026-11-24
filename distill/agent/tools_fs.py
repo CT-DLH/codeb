@@ -234,39 +234,208 @@ def list_dir(path: str = ".", pattern: str = "*", root: str = "infohub") -> str:
     return "\n".join(out) if out else "（空）"
 
 
-def grep_text(pattern: str, path: str = ".", max_hits: int = 20, root: str = "infohub") -> str:
-    """在目录下搜字符串（子串匹配），返回 路径:行号:内容。"""
+def resolve_loose(path: str, root: str) -> tuple[Path | None, str]:
+    """比 `resolve` 宽容的路径解析：模型写裸文件名时按 basename 找。
+
+    为什么要它：实测模型会把文件写成 `path: "Sidebar.tsx"`、`path: "App.tsx"`，
+    意思是「那个文件」。严格按目录解析会返回「目录不存在」，
+    模型看到这句会换一个更离谱的 path 重试（实测连试 `/app` `/root` `/home`
+    `/tmp` `/workspace` 五个都试了），7 轮烧完仍然答不出。
+    **这类失败不是模型的错，是工具把「文件」当成了「目录」。**
+
+    返回 (路径, 备注)。备注非空时应当回显给模型，让它知道自己指的是哪个文件。
+    """
     p = resolve(path, root)
+    if p is not None and p.exists():
+        return p, ""
+    base = ROOTS.get(root)
+    if base is None:
+        return None, ""
+    # 退化 1：把 path 当 basename，在仓库里找同名文件
+    name = Path(path).name
+    if not name:
+        return None, ""
+    matches = [f for f in base.rglob(name)
+               if f.is_file() and not any(
+                   seg in f.parts for seg in ("node_modules", "dist", ".git", ".cache"))]
+    if len(matches) == 1:
+        rel = matches[0].relative_to(base).as_posix()
+        return matches[0], f"（按文件名匹配到 {rel}；下次可以直接写完整相对路径）"
+    if len(matches) > 1:
+        show = ", ".join(m.relative_to(base).as_posix() for m in matches[:5])
+        return None, (f"路径 `{path}` 不存在；仓库里有 {len(matches)} 个同名文件："
+                      f"{show}\n请用完整相对路径指定其中一个。")
+    return None, ""
+
+
+def _iter_files_under(path: str, root: str) -> tuple[list[Path], str]:
+    """枚举要搜的文件，附带一条需要回显的说明（路径被宽松解析时非空）。"""
+    p, note = resolve_loose(path, root)
     if p is None:
-        return f"路径越界或不存在：{path}（仓库 {root}）"
-    if not p.exists():
-        return f"目录不存在：{path}"
-    base = ROOTS[root]
-    out: list[str] = []
-    files = [p] if p.is_file() else sorted(p.rglob("*"))
-    for f in files:
+        return [], note
+    if p.is_file():
+        return [p], note
+    out = []
+    for f in sorted(p.rglob("*")):
         if not f.is_file() or f.suffix not in EDIT_EXT | {".toml"}:
             continue
-        if "node_modules" in f.parts or "dist" in f.parts:
+        if "node_modules" in f.parts or "dist" in f.parts or ".git" in f.parts:
             continue
+        out.append(f)
+    return out, note
+
+
+def _compile_or_literal(pattern: str):
+    """正则优先；非法则退回字面子串。
+
+    模型天然写正则（`^export function|^function`），只做字面匹配会让它
+    「每次都没命中」，然后不断换写法。反过来，字面量里含 `(` `)` `[` 时
+    正则编译会报错——所以必须两条路都留。
+    """
+    try:
+        return _re.compile(pattern), ""
+    except _re.error as e:
+        return None, f"（正则非法，按字面匹配：{e}）"
+
+
+def grep_text(pattern: str, path: str = ".", max_hits: int = 20, root: str = "infohub") -> str:
+    """在目录（或单个文件）里搜，返回 路径:行号:内容。
+
+    pattern 支持正则，非法时退回字面子串。
+    path 可以是目录、相对路径，或裸文件名（实测模型常写后者）。
+    """
+    files, note = _iter_files_under(path, root)
+    if not files:
+        p = resolve(path, root)
+        if p is not None and p.exists():
+            return f"{path} 下没有可搜索的源码文件"
+        return (f"路径不存在：{path}（仓库 {root}）"
+                + (f"\n{note}" if note else "")
+                + "\n可以用相对仓库根的路径，例如 apps/web/src/components/Sidebar.tsx；"
+                  "或直接给文件名（会按 basename 匹配）。")
+    rx, note2 = _compile_or_literal(pattern)
+    base = ROOTS[root]
+    out: list[str] = []
+    for f in files:
         try:
             for i, line in enumerate(
                 f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-                if pattern in line:
+                hit = bool(rx.search(line)) if rx else (pattern in line)
+                if hit:
                     try:
                         rel = f.relative_to(base).as_posix()
                     except ValueError:
                         rel = f.name
                     out.append(f"{rel}:{i}: {line.strip()[:120]}")
                     if len(out) >= max_hits:
-                        return "\n".join(out)
-        except Exception:
+                        head = f"命中已达上限 {max_hits} 条{note}{note2}"
+                        return head + "\n" + "\n".join(out)
+        except OSError:
             continue
-    return "\n".join(out) if out else "没有命中"
+    if not out:
+        return (f"没有命中 `{pattern}`{note}{note2}\n"
+                "（确认 pattern：它在别的仓库吗？大小写不同？需要正则吗？）")
+    return f"命中 {len(out)} 条{note}{note2}\n" + "\n".join(out)
+
+
+# ---------------------------------------------------------------- 归约型查询工具
+#
+# 这两个工具的存在理由是**实测出来的**，不是设计推导：
+# 同一批「第几行 / 几个」的题，在 155k 全文上下文里答对 0/3；
+# 给 grep（返回命中行）后只升到 1/3——模型拿到 30 行原料，自己数，数错；
+# 换成直接返回条数的 grep_count 后升到 3/3。
+#
+# 所以：**让模型自己数，等于没算**。这与「算出来的信息不给，等于没算」
+# （kb_dispatch 说「6 个文件」却不列出，被同一参数重调 3 次）是同一条教训的两面：
+# 前者是「算了不给」，后者是「给了不给归约结果」。
+
+def _iter_files(path: str, root: str):
+    """按 kb 的选型口径枚举候选文件（只用 tools_fs 已有的 EDIT_EXT）。
+
+    走 resolve_loose：模型写裸文件名时按 basename 找，而不是报「目录不存在」。
+    """
+    files, _note = _iter_files_under(path, root)
+    yield from files
+
+
+def _rel_to(f: Path, root: str) -> str:
+    try:
+        return f.relative_to(ROOTS[root]).as_posix()
+    except ValueError:
+        return f.name
+
+
+def grep_count(pattern: str, path: str = ".", root: str = "infohub",
+               max_show: int = 20) -> str:
+    """**直接返回命中条数**——回答「有几个」时用它，不要自己数 grep 的输出。
+
+    pattern 是 Python 正则（非法时退回字面子串匹配：模型常写 `let x =` 这种
+    含正则元字符的字面量，直接报错会让它重试同一个调用）。
+    """
+    try:
+        rx = _re.compile(pattern)
+    except _re.error as e:
+        rx = None
+        compile_note = f"（正则非法，按字面匹配：{e}）"
+    else:
+        compile_note = ""
+
+    n = 0
+    where: list[str] = []
+    files, note = _iter_files_under(path, root)
+    if not files:
+        return (f"路径不存在或没有可搜的源码：{path}（仓库 {root}）"
+                + (f"\n{note}" if note else ""))
+    for f in files:
+        try:
+            for i, line in enumerate(
+                    f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                hit = bool(rx.search(line)) if rx else (pattern in line)
+                if hit:
+                    n += 1
+                    if len(where) < max_show:
+                        where.append(f"{_rel_to(f, root)}:{i}: {line.strip()[:100]}")
+        except OSError:
+            continue
+
+    head = f"命中 {n} 条{note}{compile_note}"
+    if n == 0:
+        return head + (f"\n（没有命中 `{pattern}`。检查是否含不该有的正则元字符，"
+                       "或换个路径）")
+    return head + "\n" + "\n".join(where) + (
+        f"\n…还有 {n - len(where)} 条未列出" if n > len(where) else "")
+
+
+def find_line(literal: str, path: str = ".", root: str = "infohub",
+              max_hits: int = 10) -> str:
+    """定位一个字面量出现的 **文件:行号**——回答「第几行」时用它。
+
+    与 grep_count 互补：那个给数量，这个给位置。两者都**不做算术**，
+    模型只负责转述。
+    """
+    hits: list[str] = []
+    files, note = _iter_files_under(path, root)
+    if not files:
+        return (f"路径不存在或没有可搜的源码：{path}（仓库 {root}）"
+                + (f"\n{note}" if note else ""))
+    for f in files:
+        try:
+            for i, line in enumerate(
+                    f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                if literal in line:
+                    hits.append(f"{_rel_to(f, root)}:{i}: {line.strip()[:120]}")
+                    if len(hits) >= max_hits:
+                        return (f"命中 {len(hits)} 处（已达上限 {max_hits}）{note}\n"
+                                + "\n".join(hits))
+        except OSError:
+            continue
+    if not hits:
+        return (f"没有找到 `{literal}`{note}\n"
+                "（确认一下字面量：是否多了空格、是否只是大小写不同、是否在别的仓库）")
+    return f"命中 {len(hits)} 处{note}\n" + "\n".join(hits)
 
 
 def _check_allowed(path: str, root: str, allowed: list[str], denied: list[str]) -> str | None:
-    """返回 None 表示可写；否则返回拒绝原因。"""
     if _denied(path):
         return f"拒绝写入（命中永久禁止清单）：{path}"
     p = resolve(path, root)

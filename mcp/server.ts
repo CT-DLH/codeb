@@ -272,6 +272,74 @@ const TOOLS: ToolDef[] = [
     }
   },
   {
+    name: "kb_route",
+    description:
+      "按**路由规格**装订：成员集 + 每成员保真度。装订单位比 kb_pack 更细，也更准。\n" +
+      "\n" +
+      "什么时候用它而不是 kb_pack：你要的是一组「跨目录、各自要看不同程度」的文件。\n" +
+      "kb_pack 装目录时按「预算 ÷ 文件数」平分额度，实测 200k 预算下 apps/web 的\n" +
+      "43 个文件里仍有 19 个大文件被降级成大纲（含 20111 tok 的 QuestionPanel）——\n" +
+      "给了预算也拿不到原文。路由把保真度交给调用方决定。\n" +
+      "\n" +
+      "role 三档：\n" +
+      "- full    全文（原文进上下文）\n" +
+      "- index   函数级索引，正文用 read_block 按需取（省一半以上，适合 api.ts 这类巨型文件）\n" +
+      "- outline 只有签名行\n" +
+      "\n" +
+      "**不变式：成员清单永不丢。** 超预算时默认拒绝装订并打印明细（超多少、每成员多少），\n" +
+      "只有显式 degrade=true 才按 full→index→outline 降档，并在包顶写警告。\n" +
+      "理由：悄悄降一档，答案就基于大纲而不是原文，而它长得像装订成功。\n" +
+      "\n" +
+      "两种用法：\n" +
+      "1) specPath：给规格文件（{repo, entry, budget, members[], questions[]}）\n" +
+      "2) around：只**提议**成员、不装订，返回每个候选的 tok 与建议 role\n" +
+      "\n" +
+      "**定位/计数类问题不要靠装订回答**：实测模型在 155k 上下文里数不准（0/3），\n" +
+      "即使给 grep 原始命中仍只有 1/3。那类问题要用 grep_count / find_line 工具。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        specPath: {
+          type: "string",
+          description: "路由规格 JSON 路径（与 around 二选一）"
+        },
+        around: {
+          type: "string",
+          description:
+            "入口文件路径：只提议候选成员（tok / 建议 role / 被谁 import），不装订"
+        },
+        depth: {
+          type: "number",
+          description: "around 的 import 深度，默认 1。实测深度 2 会经由 api.ts 拉进整个 API 表面"
+        },
+        budget: { type: "number", description: "覆盖规格里的 token 预算" },
+        degrade: {
+          type: "boolean",
+          description:
+            "超预算时允许自动降档。默认 false = 拒绝装订并报明细（推荐先看明细再决定）"
+        }
+      }
+    },
+    handler: async (a) => {
+      const hasSpec = typeof a?.specPath === "string" && a.specPath.length > 0;
+      const hasAround = typeof a?.around === "string" && a.around.length > 0;
+      if (hasSpec === hasAround) {
+        return fail("必须且只能给一个：specPath（装订）或 around（提议）");
+      }
+      const args = ["route"];
+      if (hasSpec) args.push("--spec", String(a.specPath));
+      if (hasAround) {
+        args.push("--around", String(a.around));
+        if (typeof a?.depth === "number") args.push("--depth", String(a.depth));
+      }
+      if (typeof a?.budget === "number" && a.budget > 0) {
+        args.push("--budget", String(a.budget));
+      }
+      if (a?.degrade === true) args.push("--degrade");
+      return text(await kbJson(args));
+    }
+  },
+  {
     name: "kb_upsert",
     description:
       "写入知识库：命中即更新、miss 即补充。这是模型维护知识库的**唯一写入口**。\n" +

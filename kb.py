@@ -35,6 +35,7 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -47,7 +48,6 @@ REPO_DIR = "repo"
 SHARED = "_shared"
 INDEX_NAME = "codeb-index.db"          # sqlite 派生索引（md 仍是 source of truth）
 INDEX_SCHEMA_VERSION = 2   # v2：blocks 增加 purpose / purpose_src
-IGNORE_NAME = ".kbignore"     # 选型规则（gitignore 语法）；与 md 的分工见文件头注释
 
 # sqlite 是 stdlib，不破坏 kb.py 零外部依赖的约束。
 # 表设计对应「页表」比喻：blocks = 源码页表，covers/pages = 知识页表。
@@ -119,148 +119,48 @@ _SLUG_BAD = re.compile(r"[^a-z0-9]+")
 
 
 class IgnoreRules:
-    """gitignore 语法的选型规则（.kbignore）。
+    """兼容层：`.kbignore` 已停用，选型规则的唯一来源是 git。
 
-    为什么规则要独立成文件而不写进 Markdown：
-      - 这是**机器执行**的判决（哪些文件算源码），必须能被程序直接解析；
-      - 规则有作用域（全局 vs 某仓库）、有优先级（后规则覆盖前规则），
-        散文表达不了这种结构；
-      - 改一个模式不该动任何知识页的正文，反之亦然。
+    原先另立 `.kbignore` 当「第二套真值」，两份规则会互相矛盾——实测
+    `webview/` 的 8 个文件都已进 git，却被 `.kbignore` 排除，`pack/dispatch`
+    报「0 个代码文件」，而 `route --around` 又能看见它们。两条路径对同一批
+    文件给出相反结论，正是双真值的代价。
 
-    只实现 gitignore 里真正用得到的子集：`/` 目录、`!` 反向豁免、
-    `*` 单段通配、`**` 跨段通配、行尾注释。不实现 shell 转义（用不着）。
+    现在 `ignored()` 恒为 False；`prune_dir()` 只保留依赖/产物目录的兜底跳过，
+    它们在 git 不可用时仍需挡住 node_modules/dist 这类噪音。
     """
 
-    def __init__(self, rules: list[tuple[bool, bool, "re.Pattern[str]"]]):
-        self._rules = rules
+    def __init__(self, rules: list | None = None):
+        self._rules = rules or []
 
     def __len__(self) -> int:
         return len(self._rules)
 
     @classmethod
-    def load(cls, root: Path) -> "IgnoreRules":
-        path = repo_root(root) / IGNORE_NAME
-        if not path.is_file():
-            return cls([])
-        return cls.parse(_read_text_robust(path))
+    def load(cls, root: Path | None = None) -> "IgnoreRules":
+        return cls([])
 
     @classmethod
     def parse(cls, text: str) -> "IgnoreRules":
-        rules: list[tuple[bool, bool, re.Pattern[str]]] = []
-        for raw in text.replace("\r\n", "\n").split("\n"):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            # 行尾注释：只在前面有空白时才切，避免误伤 `a#b` 这种真实文件名
-            if " #" in line:
-                line = line.split(" #", 1)[0].rstrip()
-            if not line:
-                continue
-            negate = line.startswith("!")
-            if negate:
-                line = line[1:].strip()
-                if not line:
-                    continue
-            is_dir = line.endswith("/")
-            body = line.rstrip("/")
-            anchored = body.startswith("/")
-            body = body.lstrip("/")
-            rules.append((negate, is_dir, cls._compile(body, anchored)))
-        return cls(rules)
-
-    @staticmethod
-    def _compile(pattern: str, anchored: bool) -> "re.Pattern[str]":
-        """glob → 正则。锚定模式只匹配路径开头，否则任意层都能命中。"""
-        out = []
-        i = 0
-        n = len(pattern)
-        while i < n:
-            if pattern.startswith("**", i):
-                i += 2
-                if i < n and pattern[i] == "/":
-                    i += 1
-                    out.append("(?:.*/)?")   # `a/**/b` 里的 `**/` 可匹配零层
-                else:
-                    out.append(".*")         # 行尾 `**` 吃掉剩下的全部
-                continue
-            c = pattern[i]
-            if c == "*":
-                out.append("[^/]*")
-            elif c == "?":
-                out.append("[^/]")
-            else:
-                out.append(re.escape(c))
-            i += 1
-        body = "".join(out)
-        prefix = "^" if anchored else "^(?:.*/)?"
-        # 目录规则同时要命中它下面的所有文件，所以允许尾部任意延伸
-        return re.compile(prefix + body + r"(?:/.*)?$")
+        return cls([])
 
     def ignored(self, rel: str) -> bool:
-        """rel 是相对知识库根的 posix 路径。后规则覆盖前规则。"""
-        rel = rel.replace("\\", "/").lstrip("./")
-        verdict = False
-        for negate, _is_dir, rx in self._rules:
-            if rx.match(rel):
-                verdict = not negate
-        return verdict
+        return False
 
     def excluded(self, rel: str) -> bool:
-        """语义糖：ignored 且不是被 `!` 反向豁免回来的。"""
-        return self.ignored(rel)
+        return False
 
     def prune_dir(self, rel: str) -> bool:
-        """这个目录能否整个跳过（不再向下遍历）。
-
-        只有**目录型规则**命中、且没有任何 `!` 反向豁免可能落在该目录下时
-        才剪枝。否则 `参考项目/` 会被整棵跳过，但 `!infohub/collector/`
-        这种豁免就在它的兄弟位置——必须逐条判断，不能一剪了之。
-        """
-        rel = rel.replace("\\", "/").lstrip("./")
-        hit = False
-        for negate, is_dir, rx in self._rules:
-            if rx.match(rel):
-                hit = not negate
-        if not hit:
-            return False
-        # 有任何 `!` 规则以该目录为前缀，就不能剪
-        for negate, _is_dir, _rx in self._rules:
-            if negate:
-                return False
-        return True
+        parts = rel.replace("\\", "/").split("/")
+        return any(part in SRC_SKIP for part in parts)
 
     def walk(self, base: Path, exts: set[str], repo: str = "") -> list[str]:
-        """按 .kbignore 遍历，返回相对 base 的源码路径。
-
-        用 os.scandir 手动递归而不是 Path.rglob：rglob 会先钻进 1856 个
-        第三方文件所在的目录再逐个判断，慢到不可用；这里遇到被 ignore 的
-        目录直接不再进入。
-
-        repo 是仓库名（如 `infohub`），用来拼出 `.kbignore` 里带仓库前缀的
-        匹配路径；传空串时按裸路径匹配（适合知识库根下的相对路径）。
-        """
-        out: list[str] = []
-        stack = [("", base)]
-        while stack:
-            rel_dir, cur = stack.pop()
-            try:
-                entries = list(os.scandir(cur))
-            except OSError:
-                continue
-            for e in entries:
-                rel = f"{rel_dir}/{e.name}" if rel_dir else e.name
-                match_path = f"{repo}/{rel}" if repo else rel
-                try:
-                    if e.is_dir(follow_symlinks=False):
-                        if self.ignored(match_path) or self.prune_dir(match_path):
-                            continue
-                        stack.append((rel, Path(e.path)))
-                    elif e.is_file() and Path(e.name).suffix in exts:
-                        if not self.ignored(match_path):
-                            out.append(rel)
-                except OSError:
-                    continue
-        return sorted(out)
+        out = []
+        for f in sorted(base.rglob("*")):
+            if f.is_file() and f.suffix in exts and not self.prune_dir(
+                    f.relative_to(base).as_posix()):
+                out.append(f.relative_to(base).as_posix())
+        return out
 
 
 def est_tokens(text: str) -> int:
@@ -1316,11 +1216,38 @@ def scope_repo(roots: dict[str, Path], scope: str) -> tuple[str | None, Path | N
     return None, None
 
 
+def git_files(base: Path) -> set[str] | None:
+    """返回仓库内被 git 认可的 posix 路径集合；git 不可用时返回 None。
+
+    选「已跟踪 + 未跟踪但未忽略」：
+      --cached                 已跟踪（进 git 的就是重要的）
+      --others --exclude-standard  新建但未被 .gitignore 排除的
+    这样刚建好、还没 add 的源码也能进包，而 .gitignore 仍然生效——
+    选型规则的唯一真值回到 git 自己，不再有 .kbignore 这第二份清单。
+    """
+    if not (base / ".git").exists():
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(base), "ls-files",
+             "--cached", "--others", "--exclude-standard", "-z"],
+            capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return {x for x in r.stdout.decode("utf-8", "replace").split("\0") if x}
+
+
 def src_files(base: Path, rel: str, root: Path | None = None) -> list[str]:
     """目录下的源码与配置，返回相对仓库根的路径。
 
-    排除规则来自 `.kbignore`（gitignore 语法，单一来源）；`SRC_SKIP` 只作为
-    兜底，防止 ignore 文件缺失时把 node_modules / 构建产物扫进来。
+    选型规则的唯一来源是 git：进入 git 的就是重要内容。
+      - git 可用：只取 git 认可的文件（已跟踪 + 未跟踪未忽略），
+        `.kbignore` 完全不看。
+      - git 不可用 / 无 .git：退回扫整个项目，但仍跳过依赖/产物目录
+        （node_modules / dist / .git / _kbwork 等），否则包会被噪音淹没。
 
     这里**不**过滤锁文件与生成清单：它们是写范围的一部分，dispatch 必须看见
     才能报出串行点。是否装进册子由调用方按 CONF_SKIP_NAMES 决定。
@@ -1328,18 +1255,23 @@ def src_files(base: Path, rel: str, root: Path | None = None) -> list[str]:
     d = base / rel
     if not d.is_dir():
         return []
-    rules = IgnoreRules.load(root) if root is not None else None
-    out = []
+
+    # 先确定候选池：git 认可的文件，或整个项目（兜底）
+    tracked = git_files(base)
+
+    out: list[str] = []
     for f in sorted(d.rglob("*")):
-        if any(part in SRC_SKIP for part in f.parts):
-            continue
         if not f.is_file() or f.suffix not in SRC_EXT:
             continue
-        if rules is not None:
-            repo_name = base.name
-            if rules.ignored(f"{repo_name}/{f.relative_to(base).as_posix()}"):
-                continue
-        out.append(f.relative_to(base).as_posix())
+        # d 已经是目标目录，f 必在 d 下，无需再做前缀过滤
+        r = f.relative_to(base).as_posix()
+        # 依赖/产物目录永远跳过（无论 git 是否可用）
+        if any(part in SRC_SKIP for part in f.parts):
+            continue
+        # git 可用时，只保留它认可的文件；否则保留全部
+        if tracked is not None and r not in tracked:
+            continue
+        out.append(r)
     return out
 
 
@@ -1585,6 +1517,9 @@ def cmd_pack(root: Path, args) -> int:
     # 实测该场景 agent 自己找到 pack 后仍花了 7183 tok，其中 72% 是源码。
     no_source = bool(getattr(args, "no_source", False))
     index_only = bool(getattr(args, "index", False))
+    # 提前定义：下面的「0 块」错误分支要判断「目录里到底有没有源码」，
+    # 而它原先只存在于 else 分支里，单文件路径会 NameError。
+    files: list[str] = []
 
     # L1 目标源码：单文件按预算决定全文/大纲，目录按同一预算分摊
     # --index：只给函数级索引（页表），正文用 read_block 按需调入。
@@ -1592,14 +1527,20 @@ def cmd_pack(root: Path, args) -> int:
     if is_file:
         if not no_source:
             if index_only:
-                b = _source_index_block(target, scope)
+                b = _source_index_block(target, rel_scope)
             else:
-                b = render_source(target, scope, 5, 4,
+                b = render_source(target, rel_scope, 5, 4,
                                   allowance=int(budget * TARGET_BUDGET_SHARE))
             if b:
                 blocks.append(b)
     else:
-        files = [r for r in src_files(base, scope, root) if pathlib_name(r) not in CONF_SKIP_NAMES]
+        # **必须传 rel_scope，不能传 scope**。`scope` 可能带仓库前缀
+        # （`atomkgraph/apps/web/src/components/`），而 `src_files` 按仓库根相对路径
+        # 找目录，带前缀时恒返回空列表 → 装出一份 0 块 0 tok 的空册子且 rc=0。
+        # 单文件那条路径不受影响（它用 target，本来就是剥过前缀的），
+        # 所以这个 bug 只出现在「带前缀的目录」上，实测才被发现。
+        files = [r for r in src_files(base, rel_scope, root)
+                 if pathlib_name(r) not in CONF_SKIP_NAMES]
         share = int(budget * TARGET_BUDGET_SHARE / max(len(files), 1))
         for rel in files:
             if no_source:
@@ -1631,8 +1572,12 @@ def cmd_pack(root: Path, args) -> int:
     # 那不叫兄弟，那是又来一份全库目录。
     if is_file:
         sib_dir = target.parent.relative_to(base).as_posix()
+        # 比 rel_scope 而不是 scope：`r` 是仓库内相对路径，`scope` 可能带仓库前缀，
+        # 二者永不相等，于是落点文件会被当成自己的兄弟再装一份大纲。
+        # 实测 `pack atomkgraph/.../ui/button.tsx` 多出 prio1 的同名块（43 tok），
+        # 裸路径写法没有——一重一轻，所以它不报错，只是白付 token。
         sibs = [r for r in src_files(base, sib_dir, root)
-                if r != scope and pathlib_name(r) not in CONF_SKIP_NAMES]
+                if r != rel_scope and pathlib_name(r) not in CONF_SKIP_NAMES]
         if len(sibs) <= SIBLING_MAX_FILES:
             for rel in sibs:
                 sig, nl = file_outline(base / rel)
@@ -1670,6 +1615,21 @@ def cmd_pack(root: Path, args) -> int:
     # agent 会照着源码开工，却不知道那些「不要修正」的站点事实。
     # 这时必须明说，而不是安静地交出一份看着完整的册子。
     know_lost = not any(b.prio in (2, 3) for b in blocks)
+
+    # 0 块 0 tok 是硬错误，不是「空结果」。两种情况必须分开报：
+    #   (a) 目录/文件真的没有源码     → 范围给错了
+    #   (b) 路径压根没解析出来         → 实现有 bug
+    # 合并报「0 块」会让 (b) 伪装成 (a)。前缀归一那个 bug 就是这么藏住的：
+    # 带前缀的目录恒装出 0 块，而 rc=0，看起来像「这个目录没东西」。
+    # --no-source 是显式只要知识层，此时 0 块合理，不在此列。
+    if total == 0 and not no_source:
+        _err(f"装订结果是 0 块 / 0 tok：{scope}")
+        if is_file:
+            _err(f"  这个文件存在（{target}），但抽不出任何内容——检查后缀是否在 SRC_EXT 里")
+        elif not files:
+            _err(f"  目录存在（{target}），但按 SRC_EXT 没扫到任何源码文件。")
+            _err(f"  若里面有源码，检查它是否被 .gitignore 排除，或后缀是否在 SRC_EXT 里。")
+        return 2
 
     if args.json:
         print(json.dumps({
@@ -1791,6 +1751,10 @@ def cmd_agent(root: Path, args) -> int:
         argv.append("--no-cmd")
     if args.note:
         argv += ["--note", args.note]
+    if args.route:
+        argv += ["--route", args.route]
+        if args.route_degrade:
+            argv.append("--route-degrade")
     if args.persist:
         argv.append("--persist")
     return _run_agent_proc(argv, args.json, multi=False)
@@ -1933,11 +1897,17 @@ def cmd_dispatch(root: Path, args) -> int:
     info = []
     for scope in scopes:
         repo, base = scope_repo(roots, scope)
-        target = (base / scope) if base is not None else None
+        # target 必须用剥过前缀的路径。`base` 已经是该仓库的磁盘根，
+        # 再拼一次带前缀的 scope 就变成 `<root>/atomkgraph/apps/...` → 不存在。
+        # 这会让 dispatch 对「带前缀目录」直接报错，而 pack 却能跑（它用了
+        # rel_scope），两个命令对同一个 scope 给出相反结论。
+        rel = scope[len(repo) + 1:] if (repo and scope.startswith(repo + "/")) else scope
+        target = (base / rel) if base is not None else None
         if base is None or target is None or not target.exists():
             _err(f"{scope} 定位不到（先在仓库 overview 页写 root: <磁盘路径>）")
             return 2
-        files = [scope] if target.is_file() else src_files(base, scope, root)
+        # files 也用 rel：src_files 按仓库根相对路径找目录，带前缀恒返回空。
+        files = [rel] if target.is_file() else src_files(base, rel, root)
         info.append({"scope": scope, "repo": repo, "base": base, "files": files,
                      "claims": claiming_pages(pages, scope)})
 
@@ -2109,6 +2079,459 @@ def cmd_where(root: Path, args) -> int:
     for h in hits:
         print(f"  {h['rel']}  —  {h['title']}")
     return 0
+
+
+# ------------------------------------------------------------------ 路由装订
+#
+# 装订单位从「一个范围」扩到「一条路由」：成员集 + 每成员保真度。
+#
+# 为什么不复用 cmd_pack 的目录分支：那个分支按「预算 ÷ 文件数」平分额度，
+# 于是给了 200k 预算，最大的那几个文件仍然只给大纲——实测 apps/web 43 个
+# 文件在 200k 下 share=2790，19 个文件（含 20111 tok 的 QuestionPanel）被降级。
+# 路由的判据不是「平均」，是「leader 点名了这个文件，所以他最知道要看多细」。
+#
+# 一条不变式：**成员清单永不丢**。预算不够只降档（full→index→outline），
+# 实测按 prio 阶梯压预算时，5383 tok 的落点文件会被整块删掉，留下 830 tok 的
+# 小文件——agent 会以为「这个范围只有这些」。
+
+ROUTE_ROLES = ("full", "index", "outline")
+# 每档在预算压力下的丢弃顺序。数字越小越先降级。
+ROUTE_ROLE_PRIO = {"outline": 1, "index": 2, "full": 3}
+
+
+def _route_member_block(base: Path, rel: str, role: str) -> Block | None:
+    """按角色装订一个成员。三档各复用现成实现，不重写抽取逻辑。
+
+    任何一档都**不允许返回 None**（文件存在的前提下）：成员清单永不丢是
+    路由的硬不变式，而 `_source_index_block` 在子进程失败/超时时会返回 None——
+    那会让成员整块消失，且 `members[]` 里它还在，只显示 0 tok。
+    实测就发生过：同一个规格，CLI 跑出 3 个成员，MCP 跑出来只有 2 个块。
+    """
+    p = base / rel
+    if not p.is_file():
+        return None
+    if role == "index":
+        b = _source_index_block(p, rel)
+        if b is not None:
+            return b
+        # 索引抽取失败：退回大纲，并在块头写明，别让 agent 以为拿到了索引
+        sig, nl = file_outline(p)
+        return Block(2, f"{rel}  {nl} 行  大纲（语义块索引抽取失败，退大纲）",
+                     sig or "（无签名可抽，用 read_file_range 按行号读）")
+    if role == "outline":
+        sig, nl = file_outline(p)
+        if not sig:
+            # 抽不出签名（纯数据文件等）：给全文，不交空块
+            try:
+                text = _read_text_robust(p).replace("\r\n", "\n")
+            except OSError:
+                return None
+            return Block(5, f"{rel}  {nl} 行  全文（无法抽签名，退全文）", text)
+        return Block(5, f"{rel}  {nl} 行  大纲（只给签名）", sig)
+    # full：**必须给一个大 allowance 或直接读文本**。
+    # render_source(allowance=0) 不是「不限」，是「按 400 行启发式」——
+    # 526 行的文件会拿到大纲（809 tok）而不是全文（5383 tok）。
+    # 默认值有语义时，省略参数就是一次误表达（同 --with-source 那次）。
+    try:
+        text = _read_text_robust(p).replace("\r\n", "\n")
+    except OSError:
+        return None
+    nl = len(text.splitlines())
+    return Block(5, f"{rel}  {nl} 行  全文", text)
+
+
+def _route_degrade_role(role: str) -> str:
+    """降一档：full→index→outline→outline（到底了就停在 outline）。"""
+    return {"full": "index", "index": "outline"}.get(role, "outline")
+
+
+def cmd_route(root: Path, args) -> int:
+    """按路由规格装订：显式成员集 + 每成员保真度 + 知识层，成员清单永不丢。"""
+    spec_path = Path(args.spec)
+    try:
+        spec = json.loads(_read_text_robust(spec_path))
+    except OSError as e:
+        _err(f"读不到路由规格：{spec_path}（{e}）")
+        return 2
+    except json.JSONDecodeError as e:
+        _err(f"路由规格不是合法 JSON：{spec_path}\n  {e}")
+        return 2
+    if not isinstance(spec, dict):
+        _err("路由规格必须是对象：{repo, entry, budget, members[]}")
+        return 2
+
+    members_raw = spec.get("members") or []
+    if not isinstance(members_raw, list) or not members_raw:
+        _err("路由规格缺 members[]（至少一个 {path, role}）")
+        return 2
+
+    repo = spec.get("repo") or ""
+    entry = norm(spec.get("entry") or "")
+    roots = repo_roots(root)
+    if not repo:
+        repo, base = scope_repo(roots, entry)
+    else:
+        base = roots.get(repo)
+    if base is None:
+        _err(f"仓库 `{repo or '?'}` 定位不到磁盘根。已知：{', '.join(sorted(roots)) or '（无）'}")
+        return 2
+
+    # 成员归一：允许写 `atomkgraph/apps/web/...`，内部一律用剥过前缀的 rel。
+    members: list[dict] = []
+    for i, m in enumerate(members_raw):
+        if not isinstance(m, dict) or not m.get("path"):
+            _err(f"members[{i}] 缺 path")
+            return 2
+        raw = norm(m["path"])
+        rel = raw[len(repo) + 1:] if repo and raw.startswith(repo + "/") else raw
+        role = (m.get("role") or "full").lower()
+        if role not in ROUTE_ROLES:
+            _err(f"members[{i}].role 只能是 {ROUTE_ROLES}，收到 `{role}`")
+            return 2
+        members.append({"path": rel, "role": role, "why": m.get("why") or ""})
+
+    missing = [m["path"] for m in members if not (base / m["path"]).is_file()]
+    if missing:
+        # 规格落盘的是**意图**，所以文件被删时必须立刻报错——
+        # 册子落盘才会静默说谎（照着旧内容开工）。
+        _err(f"路由里有 {len(missing)} 个成员在磁盘上不存在：")
+        for p in missing[:10]:
+            _err(f"  {p}")
+        _err(f"（仓库 `{repo}` → {base}）")
+        return 2
+
+    # leader 预设的问题。必须尽早取出：JSON 输出里也要带上它，
+    # 否则走 MCP 的 agent 看不到问题清单（那条路径只转发 JSON）。
+    questions = [str(q) for q in (spec.get("questions") or []) if str(q).strip()]
+
+    budget = args.budget or spec.get("budget") or PACK_BUDGET
+    blocks: list[Block] = []
+    for m in members:
+        b = _route_member_block(base, m["path"], m["role"])
+        if b:
+            b.prio = ROUTE_ROLE_PRIO[m["role"]]
+            blocks.append(b)
+
+    # 知识层：每个成员各自反查，按 (页, 节) 去重。
+    # 只取正文/标题里点名了该文件 stem 的小节——与 pack 同一判据。
+    pages = list(all_pages(root))
+    seen_sec: set[tuple[str, str]] = set()
+    know_blocks: list[Block] = []
+    for m in members:
+        stem = pathlib_name(m["path"])
+        for pg, _kind in claiming_pages(pages, m["path"], f"{repo}/{m['path']}"):
+            for level, title, body in page_sections(pg):
+                if level <= 1:
+                    continue
+                if stem not in title and stem not in body:
+                    continue
+                key = (pg.rel, title)
+                if key in seen_sec:
+                    continue
+                seen_sec.add(key)
+                know_blocks.append(Block(0, f"{pg.rel} :: {title}", body))
+    blocks.extend(know_blocks)
+
+    # ---- 预算：只降档，不删成员 ----
+    total = sum(b.tokens for b in blocks)
+    degraded: list[dict] = []
+    dropped_know: list[Block] = []
+
+    def _member_block(rel: str) -> Block | None:
+        """按 label 前缀找回某成员当前的块。"""
+        return next((x for x in blocks if x.label.startswith(rel + "  ")), None)
+
+    if total > budget and args.degrade:
+        # 阶梯降档：full→index→outline→(停)。每轮把「降了能省最多」的那个降一档，
+        # 直到装得下或全部到底。按省得最多排序，而不是按顺序——
+        # 否则会先把 57 tok 的小文件降成大纲（省 20 tok），大的还在占着位置。
+        while total > budget:
+            best = None
+            for m in members:
+                nxt = _route_degrade_role(m["role"])
+                if nxt == m["role"]:
+                    continue
+                old = _member_block(m["path"])
+                new = _route_member_block(base, m["path"], nxt)
+                if old is None or new is None:
+                    continue
+                saved = old.tokens - est_tokens(new.text)
+                if saved <= 0:
+                    continue
+                if best is None or saved > best[0]:
+                    best = (saved, m, old, new, nxt)
+            if best is None:
+                break
+            saved, m, old, new, nxt = best
+            new.prio = ROUTE_ROLE_PRIO[nxt]
+            blocks[blocks.index(old)] = new
+            total -= saved
+            prev, m["role"] = m["role"], nxt
+            degraded.append({"path": m["path"], "from": prev, "to": nxt,
+                             "saved": saved})
+
+        # 还不够就先丢知识层：它比成员原文更可替代（成员清单仍然一个不少）
+        if total > budget:
+            for b in sorted(know_blocks, key=lambda x: -x.tokens):
+                if total <= budget:
+                    break
+                if b in blocks:
+                    blocks.remove(b)
+                    total -= b.tokens
+                    dropped_know.append(b)
+
+        # 全部降到 outline 仍然超：这不是「再努力一下」能解决的，
+        # 是预算比「最小可用的成员集」还小。必须报错——
+        # 否则会输出一份超预算的包，而调用方以为 `--degrade` 已经保证了装得下。
+        # 实测 800 tok 预算下 outline 档的三个成员仍要 1804 tok。
+        if total > budget:
+            _err(f"降档到底（全部 outline）仍超预算：{total} tok > {budget} tok")
+            _err("")
+            _err("每个成员的**最小**体积：")
+            for m in members:
+                b = next((x for x in blocks if x.label.startswith(m["path"] + "  ")), None)
+                _err(f"  {b.tokens if b else 0:>7} tok  {m['role']:<8} {m['path']}")
+            _err("")
+            _err(f"预算至少要给到 {total} tok，或者用 --drop 明确去掉成员。")
+            _err("这个包如果要给 agent 用，成员原文是它的全部价值——"
+                 "塞不下就是任务太大了，该拆，而不是把答案换成大纲。")
+            return 2
+
+    if total > budget and not args.degrade:
+        # 默认拒绝装订。悄悄降一档，答案就基于大纲而不是原文，
+        # 而它长得像「装订成功」——这是最难被发现的一类失败。
+        _err(f"路由装订超预算：{total} tok > {budget} tok（超 {total - budget}）")
+        _err("")
+        _err("成员明细：")
+        for m in members:
+            b = next((x for x in blocks if x.label.startswith(m["path"] + "  ")), None)
+            _err(f"  {b.tokens if b else 0:>7} tok  {m['role']:<8} {m['path']}")
+        if know_blocks:
+            _err(f"  {sum(x.tokens for x in know_blocks):>7} tok  knowledge  "
+                 f"{len(know_blocks)} 节")
+        _err("")
+        _err("三个选择（都是显式的，不会自动发生）：")
+        _err(f"  --budget <更大的数>   当前 {budget}")
+        _err("  --degrade            按 full→index→outline 自动降档，并在包顶写警告")
+        _err("  --drop <path>        点名删掉某个成员（可重复）")
+        return 2
+
+    # 成员清单：**永不丢**，放最前。它同时回答「我手上有哪些原文」
+    # 和「哪些只给了目录」——后者原先只在文末「有意省略」里，agent 得读到底。
+    if args.json:
+        print(json.dumps({
+            "repo": repo, "entry": entry, "root": str(base),
+            "budget": budget, "total": total,
+            "members": [{"path": m["path"], "role": m["role"], "why": m["why"],
+                         "tokens": (next((x.tokens for x in blocks
+                                          if x.label.startswith(m["path"] + "  ")), 0))}
+                        for m in members],
+            "knowledge": [{"label": b.label, "tokens": b.tokens} for b in know_blocks],
+            "degraded": degraded,
+            "knowledge_dropped": [{"label": b.label, "tokens": b.tokens}
+                                  for b in dropped_know],
+            # leader 预设的问题必须出现在 JSON 里：MCP 层只转发 JSON，
+            # 文本模式那段 questions 根本到不了 agent 眼里。
+            # 这是「算出来不给，等于没算」的又一次：CLI 看着有，接口里没有。
+            "questions": questions,
+            "blocks": [{"prio": b.prio, "label": b.label, "tokens": b.tokens,
+                        "text": b.text} for b in blocks],
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    out = [f"# 路由包：{entry or repo}", ""]
+    out.append(f"仓库 `{repo}` · 预算 {budget} · 实装 {total} tok · "
+               f"{len(members)} 成员 / {len(know_blocks)} 知识节")
+    if degraded:
+        out.append("")
+        out.append(f"> ⚠ **已降档 {len(degraded)} 个成员**（`--degrade`）："
+                   "下面是降档后的形态，不是 leader 原本要的保真度。")
+        for d in degraded:
+            out.append(f"> - `{d['path']}`：{d['from']} → {d['to']}（省 {d['saved']} tok）")
+    if dropped_know:
+        out.append("")
+        out.append(f"> ⚠ 知识层被挤掉 {len(dropped_know)} 节（"
+                   f"{sum(b.tokens for b in dropped_know)} tok）。"
+                   "「改了会静默出错」的约束可能就在里面。")
+
+    # 成员索引：agent 的页表
+    out.append("")
+    out.append("## 成员索引")
+    out.append("")
+    out.append("| tok | 保真度 | 成员 | 说明 |")
+    out.append("| --: | :-- | :-- | :-- |")
+    for m in members:
+        b = next((x for x in blocks if x.label.startswith(m["path"] + "  ")), None)
+        tk = b.tokens if b else 0
+        out.append(f"| {tk} | `{m['role']}` | `{m['path']}` | {m['why']} |")
+    out.append("")
+    out.append("> `full` = 原文已在下面；`index` = 只有函数级索引，正文用 "
+               "`read_block(path, key)` 取；`outline` = 只有签名。")
+    out.append("")
+
+    for b in blocks:
+        out.append(f"## {b.label}   〔{b.tokens} tok〕")
+        out.append("")
+        out.append(b.text)
+        out.append("")
+
+    # 问题清单：leader 预设的问题，一次装订后逐条问（每问都是全新调用，无历史）
+    if questions:
+        out.append("## 待回答的问题（leader 预设）")
+        out.append("")
+        for i, q in enumerate(questions, 1):
+            out.append(f"{i}. {q}")
+        out.append("")
+
+    out.append("## 有意省略")
+    out.append("")
+    if degraded:
+        for d in degraded:
+            out.append(f"- 已降档：`{d['path']}` {d['from']} → {d['to']}")
+    else:
+        out.append("- 无降档：所有成员都按规格的保真度装入。")
+    for b in dropped_know:
+        out.append(f"- 知识层被挤掉：`{b.label}`（{b.tokens} tok）— `kb read` 取回")
+    out.append("")
+    out.append("**定位/计数类问题不要靠这份包回答**：实测模型在 155k 上下文里数不准"
+               "（0/3），给 `grep` 原始命中仍只有 1/3。要用 `grep_count` / `find_line` "
+               "这种「已经算好答案」的工具。")
+    print("\n".join(out))
+    return 0
+
+
+def control_degrade(args) -> bool:
+    return bool(getattr(args, "degrade", False))
+
+
+def cmd_route_around(root: Path, args) -> int:
+    """提议器：只提议、不装订。1-hop import 闭包 + 体量，帮 leader 点成员。
+
+    --depth 默认 1 且只对 entry 展开：实测 Sidebar.tsx 1-hop 已经 19,166 tok
+    （api.ts 一人占 64%），2-hop 会经由 api.ts 拉进整个 API 表面。
+    更远处的东西由 leader 显式加成员——那是他的职责，不是解析器的推断。
+    """
+    scope = norm(args.around)
+    roots = repo_roots(root)
+    repo, base = scope_repo(roots, scope)
+    if base is None:
+        _err(f"{args.around} 定位不到磁盘根。已知：{', '.join(sorted(roots)) or '（无）'}")
+        return 2
+    rel = scope[len(repo) + 1:] if repo and scope.startswith(repo + "/") else scope
+    entry = base / rel
+    if not entry.is_file():
+        _err(f"不是文件：{rel}（--around 只接受单个入口文件）")
+        return 2
+
+    seen: dict[str, Path] = {rel: entry}
+    why: dict[str, str] = {rel: "entry"}
+    frontier = [(rel, entry)]
+    for _ in range(max(1, args.depth)):
+        nxt = []
+        for cur_rel, f in frontier:
+            for spec in _imports_of(f):
+                r = _resolve_import(spec, f, base)
+                if r is None:
+                    continue
+                r_rel = r.relative_to(base).as_posix()
+                if r_rel in seen:
+                    continue
+                seen[r_rel] = r
+                why[r_rel] = cur_rel
+                nxt.append((r_rel, r))
+        frontier = nxt
+
+    rows = []
+    for r_rel, p in seen.items():
+        try:
+            text = _read_text_robust(p)
+        except OSError:
+            continue
+        tk = est_tokens(text)
+        rows.append({"path": r_rel, "tokens": tk,
+                     "lines": len(text.splitlines()),
+                     "imported_by": why.get(r_rel, ""),
+                     "suggest": ("full" if tk <= 1500 else
+                                 "index" if tk <= 6000 else "outline")})
+    rows.sort(key=lambda x: -x["tokens"])
+
+    if args.json:
+        print(json.dumps({"repo": repo, "entry": rel, "depth": args.depth,
+                          "members": rows,
+                          "total_tokens": sum(x["tokens"] for x in rows)},
+                         ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"# 路由提议：{rel}（depth={args.depth}）")
+    print()
+    print(f"仓库 `{repo}` · {len(rows)} 个候选 · 合计 "
+          f"{sum(x['tokens'] for x in rows)} tok（建 spec 时按此选 role）")
+    print()
+    print("| tok | 行 | 建议 role | 路径 | 被谁 import |")
+    print("| --: | --: | :-- | :-- | :-- |")
+    for x in rows:
+        print(f"| {x['tokens']} | {x['lines']} | `{x['suggest']}` | "
+              f"`{x['path']}` | `{x['imported_by']}` |")
+    print()
+    print("把上面想要的成员抄进路由规格的 members[]，role 可改。")
+    print("**别全选 full**：把最大的那个改成 `index` 往往能省掉一半以上——")
+    print("实测 api.ts 一个文件就占 Sidebar 闭包的 64%。")
+    return 0
+
+
+_IMPORT_FROM = re.compile(
+    r"""^\s*(?:import|export)\b[^\n]*?from\s*['"]([^'"]+)['"]""", re.M)
+_IMPORT_BARE = re.compile(r"""^\s*import\s*['"]([^'"]+)['"]""", re.M)
+_PY_IMPORT = re.compile(r"^\s*from\s+([\w.]+)\s+import\b|^\s*import\s+([\w.]+)", re.M)
+
+
+def _imports_of(path: Path) -> list[str]:
+    """抽出一个文件的 import 说明符。
+
+    TS 项目里 import 写 `.js` 而后缀实际是 `.ts`（ESM + Bundler 解析），
+    所以要连后缀变体一起试——实测照 `.js` 直接拼路径永远找不到文件。
+    """
+    try:
+        text = _read_text_robust(path)
+    except OSError:
+        return []
+    if path.suffix in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
+        return _IMPORT_FROM.findall(text) + _IMPORT_BARE.findall(text)
+    if path.suffix == ".py":
+        out = []
+        for a, b in _PY_IMPORT.findall(text):
+            out.append(a or b)
+        return out
+    return []
+
+
+def _resolve_import(spec: str, cur: Path, base: Path) -> Path | None:
+    """解析相对 import。绝对包名（@atomkgraph/shared、react）一律跳过。"""
+    if not spec.startswith("."):
+        return None
+    cands: list[Path] = []
+    # 先试「原样使用 spec」。ESM 里 import 通常自带后缀（`./sqlite.mjs`），
+    # 而下面的 with_suffix("") 会把 `.mjs` 一起剥掉——实测 webview 的
+    # `import './sqlite.mjs'` 因此永远解析不到，`--around server.mjs`
+    # 只报出它自己 1 个候选，看起来像「这个入口没有依赖」，其实是 bug。
+    raw = cur.parent / spec
+    cands.append(raw)
+    stem = raw.with_suffix("")
+    for suf in (".ts", ".tsx", ".mjs", ".cjs", ".js", ".jsx", ".json", ""):
+        cands.append(Path(str(stem) + suf))
+    # 目录 import → index.*
+    for suf in (".ts", ".tsx", ".mjs", ".cjs", ".js", ".jsx"):
+        cands.append(raw / f"index{suf}")
+    for c in cands:
+        try:
+            c = c.resolve()
+            c.relative_to(base.resolve())
+        except (ValueError, OSError):
+            continue
+        if c.is_file():
+            return c
+    return None
+
 
 
 # ------------------------------------------------------------------ 写入串行化
@@ -2767,6 +3190,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="派发前检查：写范围互斥 / 共享知识 / 接口面 / 派生文件串行点")
     ds.add_argument("scopes", nargs="+", help="两批以上要并行的写范围")
 
+    rt = sub.add_parser("route",
+                        help="按路由规格装订：显式成员集 + 每成员保真度（full/index/outline）")
+    rt.add_argument("--spec", help="路由规格 JSON 文件（{repo, entry, budget, members[], questions[]}）")
+    rt.add_argument("--around", help="提议器：给一个入口文件，只提议成员、不装订")
+    rt.add_argument("--depth", type=int, default=1, help="--around 的 import 深度（默认 1）")
+    rt.add_argument("--budget", type=int, default=0,
+                    help=f"token 预算（默认取规格里的 budget，否则 {PACK_BUDGET}）")
+    rt.add_argument("--degrade", action="store_true",
+                    help="超预算时按 full→index→outline 降档（默认拒绝装订并报明细）")
+    rt.add_argument("--ask", action="store_true",
+                    help="装订后逐条提问（每问都是全新会话，共享同一份包前缀）")
+    rt.add_argument("--q", action="append", default=[],
+                    help="覆盖规格里的 questions（可重复）")
+
     ag = sub.add_parser("agent",
                         help="在 codeb 里组装并运行子 agent（需要 openai-agents 环境）")
     ag.add_argument("scope", nargs="?", help="写范围（代码路径，相对仓库根）")
@@ -2789,6 +3226,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="轮次上限；默认不限（任务应拆细，不要靠轮数掐断）")
     ag.add_argument("--no-cmd", action="store_true", help="不给 run_cmd 工具（只读任务）")
     ag.add_argument("--note", default="", help="追加的静态上下文（契约/警告等）")
+    ag.add_argument("--route", default="",
+                    help="路由规格 JSON：改走 kb route --spec（成员集 + 每成员保真度），"
+                         "scope 仍用于 dispatch 与白名单推导")
+    ag.add_argument("--route-degrade", action="store_true",
+                    help="路由超预算时允许自动降档（默认拒绝并报明细）")
     ag.add_argument("--python", default="", help="跑 agent 的 python（默认 agvenv）")
 
     sub.add_parser("init")
@@ -2809,6 +3251,7 @@ HANDLERS = {
     "search": cmd_search, "where": cmd_where, "graph": cmd_graph,
     "plan": cmd_plan, "upsert": cmd_upsert,
     "pack": cmd_pack, "dispatch": cmd_dispatch, "agent": cmd_agent,
+    "route": cmd_route, "route-around": cmd_route_around,
     "reindex": cmd_reindex, "blocks": cmd_blocks, "covers-check": cmd_covers_check,
 }
 
@@ -2835,6 +3278,35 @@ def main(argv: list[str] | None = None) -> int:
     if not repo_root(root).is_dir():
         print(f"{root} 不是知识库根（缺 {REPO_DIR}/）；先跑 kb init", file=sys.stderr)
         return 2
+    # route 有两个互斥入口：--spec（装订）和 --around（提议）
+    if args.cmd == "route":
+        if bool(args.spec) == bool(args.around):
+            _err("route 需要且只能给一个：--spec <file>（装订）或 --around <entry>（提议）")
+            return 2
+        if args.around:
+            return cmd_route_around(root, args)
+        if args.ask:
+            # 提问走子进程：agvenv 里才有 openai 依赖，内核本身只用标准库。
+            # 复用同一个 --spec，保证「装订出的包」与「提问用的包」是同一份。
+            script = (Path(__file__).resolve().parent
+                      / "distill" / "agent" / "route_ask.py")
+            if not script.exists():
+                _err(f"找不到 {script}（agent 层未安装）")
+                return 2
+            venv_py = (Path(__file__).resolve().parent
+                       / "_kbwork" / "agvenv" / "Scripts" / "python.exe")
+            py = str(venv_py) if venv_py.exists() else sys.executable
+            argv = [py, "-X", "utf8", str(script), "--spec", args.spec]
+            if args.budget:
+                argv += ["--budget", str(args.budget)]
+            for q in args.q:
+                argv += ["--q", q]
+            if args.json:
+                argv.append("--json")
+            # 子进程直接继承 stdout/stderr：提问是给人看的流式长任务，
+            # 中间结果不该被父进程收走再统一打印（会等到全部结束才见到任何字）。
+            return subprocess.call(argv, cwd=str(Path(__file__).resolve().parent))
+        return cmd_route(root, args)
     return HANDLERS[args.cmd](root, args)
 
 

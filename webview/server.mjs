@@ -9,6 +9,8 @@
  *   GET /app.js      → public/app.js
  *   GET /api/data    → JSON payload (data.mjs + live covers self-check)
  *   GET /api/health  → { ok: true, root, generatedAt }
+ *   GET /api/projtree → 项目目录表（project_files + file_notes，只读）
+ *                       ?repo=codeb 指定项目；缺省取第一个
  *
  * Static files are served from webview/public. Only those three names are
  * served — no path traversal. CORS is open (local dev tool).
@@ -20,7 +22,7 @@ import { fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { buildNode, buildPayload, detectRoot, parseCovers, parseParts } from './data.mjs'
-import { readIndex } from './sqlite.mjs'
+import { readIndex, readProjTree } from './sqlite.mjs'
 
 const execFileAsync = promisify(execFile)
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -225,6 +227,20 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, JSON.stringify({ path: rel, content, exists: content !== null }))
       }
       return send(res, 200, JSON.stringify(payload))
+    }
+
+    // 项目目录表：project_files（扫描生成）+ file_notes（LLM/agent 写的介绍）。
+    // 只读；改介绍走 CLI（python -m distill.projtree note），避免前端误写结构。
+    if (url.pathname === '/api/projtree') {
+      const repo = url.searchParams.get('repo') || null
+      const tree = readProjTree(ROOT, repo)
+      if (!tree) {
+        return send(res, 200, JSON.stringify({
+          live: false, source: 'none', repos: [], repo: null,
+          nodes: [], orphans: [], stats: null,
+        }))
+      }
+      return send(res, 200, JSON.stringify(tree))
     }
 
     const staticFile = STATIC[url.pathname]

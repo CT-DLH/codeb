@@ -21,8 +21,7 @@ export function dbPath(root) {
 }
 
 /** Read derived index facts; return null when unavailable. */
-export function readIndex(root) {
-  if (!DatabaseSync) return null
+export function readIndex(root) {  if (!DatabaseSync) return null
   const p = dbPath(root)
   if (!fs.existsSync(p)) return null
   let db
@@ -54,6 +53,103 @@ export function readIndex(root) {
       live: true,
       source: 'sqlite',
     }
+  } catch {
+    return null
+  } finally {
+    try { db?.close() } catch { /* ignore */ }
+  }
+}
+
+/**
+ * 目录表：project_files（扫描生成的结构） + file_notes（LLM/agent 写的介绍）。
+ *
+ * 两张表是分开的，这里只读。每个文件带上 noteState：
+ *   fresh   note_hash === content_hash      介绍与源码一致
+ *   stale   note_hash !== content_hash      源码改过，介绍可能过时
+ *   none    没有介绍
+ *   orphan  有介绍但文件已不在目录表里
+ */
+export function readProjTree(root, repo = null) {
+  if (!DatabaseSync) return null
+  const p = dbPath(root)
+  if (!fs.existsSync(p)) return null
+  let db
+  try {
+    db = new DatabaseSync(p, { readOnly: true })
+    const has = (t) => {
+      try { return !!db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(t) } catch { return false }
+    }
+    if (!has('project_files')) return null
+
+    const repos = db.prepare(
+      'SELECT repo, COUNT(*) AS n FROM project_files GROUP BY repo ORDER BY repo').all()
+      .map((r) => ({ repo: r.repo, count: Number(r.n) }))
+    const want = repo || (repos[0] && repos[0].repo)
+    if (!want) return { repos, repo: null, nodes: [], stats: null }
+
+    const rows = db.prepare(`
+      SELECT f.path, f.parent_path, f.is_dir, f.name, f.ext, f.size,
+             f.content_hash, n.purpose, n.detail, n.note_hash, n.source,
+             n.updated_at
+        FROM project_files f
+        LEFT JOIN file_notes n ON n.repo = f.repo AND n.path = f.path
+       WHERE f.repo = ?
+       ORDER BY f.is_dir DESC, f.path`).all(want)
+
+    const nodes = rows.map((r) => {
+      let state = 'none'
+      if (r.is_dir) state = ''
+      else if (r.purpose && r.note_hash && r.content_hash)
+        state = r.note_hash === r.content_hash ? 'fresh' : 'stale'
+      else if (r.purpose) state = 'fresh'
+      return {
+        path: r.path,
+        parent: r.parent_path || '',
+        name: r.name,
+        isDir: !!r.is_dir,
+        ext: r.ext || null,
+        size: r.size == null ? null : Number(r.size),
+        purpose: r.purpose || null,
+        detail: r.detail || null,
+        source: r.source || null,
+        updatedAt: r.updated_at || null,
+        state,
+      }
+    })
+
+    // 孤儿：有介绍但结构表里没有这个文件
+    let orphans = []
+    if (has('file_notes')) {
+      orphans = db.prepare(`
+        SELECT n.path, n.purpose, n.source, n.updated_at
+          FROM file_notes n
+          LEFT JOIN project_files f ON f.repo = n.repo AND f.path = n.path
+         WHERE n.repo = ? AND f.path IS NULL`).all(want)
+        .map((r) => ({ path: r.path, purpose: r.purpose || null,
+                       source: r.source || null, updatedAt: r.updated_at || null }))
+    }
+
+    const files = nodes.filter((n) => !n.isDir)
+    const stats = {
+      dirs: nodes.length - files.length,
+      files: files.length,
+      noted: files.filter((n) => n.purpose).length,
+      stale: files.filter((n) => n.state === 'stale').length,
+      missing: files.filter((n) => n.state === 'none').length,
+      orphans: orphans.length,
+    }
+    const last = db.prepare(
+      'SELECT scan_id, method, elapsed_ms FROM scan_log WHERE repo=? ' +
+      'ORDER BY scan_id DESC LIMIT 1')
+    let scan = null
+    try {
+      const r = last.get(want)
+      if (r) scan = { id: r.scan_id, method: r.method, ms: Number(r.elapsed_ms) }
+    } catch { /* scan_log 不存在时忽略 */ }
+
+    return { repos, repo: want, nodes, orphans, stats, scan, live: true,
+             source: 'sqlite' }
   } catch {
     return null
   } finally {

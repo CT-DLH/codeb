@@ -49,13 +49,9 @@ def get_enc(name: str):
 
 
 def collect_files(root: Path, exts: set[str], use_ignore: bool = True) -> list[Path]:
-    """按 kb.py 的口径枚举文件（含 SRC_SKIP 与 .kbignore）。"""
+    """按 kb.py 的口径枚举文件。选型唯一来源是 git（.kbignore 已停用）。"""
     base = root
-    rules = None
-    if use_ignore:
-        rules = kb.IgnoreRules.load(root)
-        if len(rules) == 0:
-            rules = None
+    tracked = kb.git_files(base) if use_ignore else None
 
     out: list[Path] = []
     stack = [("", base)]
@@ -75,9 +71,8 @@ def collect_files(root: Path, exts: set[str], use_ignore: bool = True) -> list[P
             if e.suffix not in exts:
                 continue
             rel = f"{rel_dir}/{e.name}" if rel_dir else e.name
-            if rules is not None:
-                if rules.ignored(f"{base.name}/{rel}"):
-                    continue
+            if tracked is not None and rel not in tracked:
+                continue
             out.append(e)
     return sorted(out)
 

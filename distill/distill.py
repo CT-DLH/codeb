@@ -528,12 +528,19 @@ PROMPT = """你在为代码知识库产出候选页面。读者是后续会话�
 
 
 def call_llm(prompt: str, mode: str, verbose: bool = False,
-             schema: dict | None = None) -> dict | None:
+             schema: dict | None = None,
+             model: str | None = None) -> dict | None:
+    """model 非空时覆盖 env 里的 ZHIHU_LLM_MODEL。
+
+    需要它是因为 infohub/collector/.env 里写死了 lightning 模型，
+    而改别人的 .env 不合适；显式传参比设环境变量更清楚。
+    """
     if mode == "none":
         return None
     if mode == "cmd":
         return _llm_cmd(prompt)
-    return _llm_openai(prompt, verbose=verbose, schema=schema)  # nvidia / openai 同一实现
+    return _llm_openai(prompt, verbose=verbose, schema=schema,  # nvidia / openai 同一实现
+                       model=model)
 
 
 def _llm_cmd(prompt: str) -> dict | None:
@@ -676,7 +683,8 @@ def _format_rejected(status: int, err: str) -> bool:
 
 
 def _llm_openai(prompt: str, verbose: bool = False,
-                schema: dict | None = None) -> dict | None:
+                schema: dict | None = None,
+                model: str | None = None) -> dict | None:
     env = load_env(verbose)
     key = env.get("ZHIHU_LLM_API_KEY")
     if not key:
@@ -684,8 +692,16 @@ def _llm_openai(prompt: str, verbose: bool = False,
             print("llm: 没有 ZHIHU_LLM_API_KEY（环境变量和 infohub/.env 都没有）")
         return None
     base = (env.get("ZHIHU_LLM_BASE_URL") or NVIDIA_BASE).rstrip("/")
-    model = env.get("ZHIHU_LLM_MODEL") or NVIDIA_MODEL
-    max_tokens = int(env.get("ZHIHU_LLM_MAX_TOKENS") or DEFAULT_MAX_TOKENS)
+    # 优先级：显式传参 > env > 内置默认。infohub 的 .env 写死了旧模型，传参才能压过它。
+    model = model or env.get("ZHIHU_LLM_MODEL") or NVIDIA_MODEL
+    # 0 表示不设上限（不传该字段）。env 里遗留的 4096 是历史配置：
+    # 它会让「一次返回几十个符号的 JSON」被截断成空，且不报错。
+    raw_max = env.get("ZHIHU_LLM_MAX_TOKENS")
+    max_tokens = int(raw_max) if raw_max and raw_max.strip() else DEFAULT_MAX_TOKENS
+    if max_tokens == 4096:          # 旧 .env 的遗留值，按"不限"处理
+        max_tokens = 0
+    if verbose:
+        print(f"llm: model={model} max_tokens={max_tokens or '不限'}")
     url = f"{base}/chat/completions"
     extra = _extra_body(base, env)
 

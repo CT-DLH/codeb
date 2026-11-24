@@ -115,3 +115,44 @@ main { padding: 20px 22px; max-width: 1500px; margin: 0 auto; }
 .detail-msg { margin-top: 8px; font-size: 12px; min-height: 16px; }
 .detail-msg.ok { color: var(--green); }
 .detail-msg.err { color: var(--red); }
+
+/* --- 项目目录表 (project_files + file_notes) --- */
+.projtree-card { margin-bottom: 18px; }
+.pt-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.pt-repos { display: flex; gap: 6px; flex-wrap: wrap; }
+.pt-repos button { padding: 4px 10px; font-size: 12px; }
+.pt-repos button.active { border-color: var(--accent); color: var(--accent); }
+.pt-filters { display: flex; gap: 5px; }
+.pt-filters button { padding: 3px 9px; font-size: 11px; }
+.pt-filters button.active { border-color: var(--purple); color: var(--purple); }
+.pt-search { margin-left: auto; min-width: 200px; background: var(--panel2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; font-size: 12px; }
+.pt-search:focus { outline: none; border-color: var(--accent); }
+.pt-kpis { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.pt-kpi { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+  padding: 5px 10px; font-size: 11px; color: var(--muted); }
+.pt-kpi b { color: var(--text); font-size: 13px; margin-left: 4px; }
+.pt-kpi.warn b { color: var(--amber); }
+.pt-kpi.ok b { color: var(--green); }
+.pt-tree { max-height: 520px; overflow: auto; font-family: Consolas, "Microsoft YaHei", monospace;
+  font-size: 12px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.pt-tree details { margin: 1px 0; }
+.pt-tree summary { cursor: pointer; padding: 2px 4px; border-radius: 4px; list-style: none; }
+.pt-tree summary::-webkit-details-marker { display: none; }
+.pt-tree summary::before { content: "▸ "; color: var(--muted); }
+.pt-tree details[open] > summary::before { content: "▾ "; }
+.pt-tree summary:hover { background: var(--panel2); }
+.pt-dir { color: var(--accent); }
+.pt-children { margin-left: 14px; border-left: 1px solid var(--line); padding-left: 8px; }
+.pt-file { display: flex; align-items: baseline; gap: 8px; padding: 2px 4px; border-radius: 4px; }
+.pt-file:hover { background: var(--panel2); }
+.pt-name { color: var(--text); white-space: nowrap; }
+.pt-purpose { color: var(--muted); font-family: "Microsoft YaHei", sans-serif;
+  font-size: 11px; word-break: break-all; }
+.pt-ext { color: var(--purple); font-size: 10px; }
+.pt-size { color: var(--muted); font-size: 10px; }
+.pt-state { font-size: 10px; padding: 1px 6px; border-radius: 7px; white-space: nowrap; }
+.pt-state.fresh { color: var(--green); border: 1px solid #245c33; }
+.pt-state.stale { color: var(--amber); border: 1px solid #6b5410; }
+.pt-state.none { color: var(--muted); border: 1px solid var(--line); }
+.pt-empty { color: var(--muted); padding: 20px; text-align: center; }

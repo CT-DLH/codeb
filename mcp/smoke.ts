@@ -98,9 +98,9 @@ async function main(): Promise<void> {
 
   const list = await call("tools/list");
   const names: string[] = (list?.tools ?? []).map((t: any) => t.name).sort();
-  check("tools/list 返回 8 个工具", names.length === 8, `实际 ${names.length}: ${names}`);
+  check("tools/list 返回 9 个工具", names.length === 9, `实际 ${names.length}: ${names}`);
   for (const want of ["kb_tree", "kb_read", "kb_heads", "kb_search", "kb_where",
-                      "kb_pack", "kb_dispatch", "kb_upsert"]) {
+                      "kb_pack", "kb_dispatch", "kb_upsert", "kb_route"]) {
     check(`工具有 ${want}`, names.includes(want));
   }
 
@@ -557,6 +557,200 @@ async function main(): Promise<void> {
   }));
   check("kb_dispatch 列出写范围内的具体文件", dispText.includes("collector/kit/paging.py"),
     dispText.slice(0, 200));
+
+  // ---------------- kb_route 回归 ----------------
+  //
+  // 三条不变式，每条都对应一次实测出来的失败：
+  //  1. 带仓库前缀的路径 == 裸路径（前缀那个 bug 会装出 0 块 0 tok 且 rc=0）
+  //  2. 成员清单永不丢（压预算时不能把大文件整块删掉）
+  //  3. 超预算默认拒绝（悄悄降档 = 答案基于大纲，而它看着像成功）
+
+  const bareDir = await call("tools/call", {
+    name: "kb_pack", arguments: { scope: "apps/web/src/components/ui/", budget: 13000 }
+  });
+  const bareDirData = JSON.parse(textOf(bareDir));
+
+  // 1. 提议器
+  const around = await call("tools/call", {
+    name: "kb_route",
+    arguments: { around: "atomkgraph/apps/web/src/components/Sidebar.tsx", depth: 1 }
+  });
+  const aroundData = JSON.parse(textOf(around));
+  check("kb_route around 找到 import 闭包", (aroundData.members ?? []).length >= 2,
+    `members=${(aroundData.members ?? []).length}`);
+  check("kb_route around 包含 api.ts（1-hop 里最大的那个）",
+    (aroundData.members ?? []).some((m: any) => m.path.endsWith("api.ts")),
+    JSON.stringify((aroundData.members ?? []).map((m: any) => m.path)));
+  check("kb_route around 给出建议 role",
+    (aroundData.members ?? []).every((m: any) =>
+      ["full", "index", "outline"].includes(m.suggest)),
+    JSON.stringify((aroundData.members ?? []).map((m: any) => m.suggest)));
+  check("kb_route around 把最大的文件建议成非 full",
+    (aroundData.members ?? [])
+      .filter((m: any) => m.tokens > 6000)
+      .every((m: any) => m.suggest !== "full"),
+    "大于 6000 tok 的文件不该建议 full");
+
+  // 2. 装订 + 每成员保真度真的生效
+  const specPath = join(HERE, "_tmp_route_smoke.json");
+  const { writeFileSync: writeSpec } = await import("node:fs");
+  writeSpec(specPath, JSON.stringify({
+    repo: "atomkgraph",
+    entry: "apps/web/src/components/Sidebar.tsx",
+    budget: 200000,
+    members: [
+      { path: "apps/web/src/components/Sidebar.tsx", role: "full", why: "落点" },
+      { path: "apps/web/src/lib/utils.ts", role: "full" },
+      { path: "apps/web/src/api.ts", role: "index" }
+    ],
+    questions: ["这个组件依赖哪些模块？"]
+  }, null, 2), "utf-8");
+
+  const routed = await call("tools/call", {
+    name: "kb_route", arguments: { specPath }
+  });
+  const routedData = JSON.parse(textOf(routed));
+  check("kb_route 成员数等于规格", (routedData.members ?? []).length === 3,
+    JSON.stringify((routedData.members ?? []).map((m: any) => m.path)));
+  check("kb_route full 成员装进了原文",
+    (routedData.blocks ?? []).some(
+      (b: any) => String(b.label).includes("Sidebar.tsx") &&
+                  String(b.label).includes("全文") &&
+                  String(b.text).includes("export function")),
+    JSON.stringify((routedData.blocks ?? []).map((b: any) => b.label)));
+  check("kb_route index 成员只给索引、不给正文",
+    (routedData.blocks ?? []).some(
+      (b: any) => String(b.label).includes("api.ts") &&
+                  String(b.label).includes("语义块索引")) &&
+    !(routedData.blocks ?? []).some(
+      (b: any) => String(b.label).includes("api.ts") && String(b.label).includes("全文")),
+    JSON.stringify((routedData.blocks ?? []).map((b: any) => b.label)));
+  check("kb_route 把 questions 带进包",
+    String(textOf(routed)).includes("这个组件依赖哪些模块？"));
+
+  // 3. 不变式：压预算 + degrade，成员一个都不能少
+  //
+  // 2,000 tok 是个「降档能救」的量级：Sidebar 5383 全文 → 746 索引，
+  // utils 78 全文保留，api.ts 本来就是索引。降到 800 就救不回来了——
+  // 全部 outline 也要 1804，那是任务太大该拆，不该假装装得下。
+  const squeezed = await call("tools/call", {
+    name: "kb_route", arguments: { specPath, budget: 2000, degrade: true }
+  });
+  const squeezedData = JSON.parse(textOf(squeezed));
+  check("kb_route 降档后成员清单一个不少",
+    (squeezedData.members ?? []).length === 3,
+    `members=${(squeezedData.members ?? []).length}`);
+  check("kb_route 降档后确实降了档",
+    (squeezedData.degraded ?? []).length > 0,
+    JSON.stringify(squeezedData.degraded));
+  check("kb_route 降档后不超预算",
+    squeezedData.total <= 2000, `total=${squeezedData.total}`);
+  check("kb_route 降档记录写明省了多少",
+    (squeezedData.degraded ?? []).every((x: any) => typeof x.saved === "number" && x.saved > 0),
+    JSON.stringify(squeezedData.degraded));
+
+  // 3b. 降到底仍超预算 → 必须报错，不能输出超预算的包
+  let tooSmallRejected = false;
+  let tooSmallMsg = "";
+  try {
+    const r = await call("tools/call", {
+      name: "kb_route", arguments: { specPath, budget: 800, degrade: true }
+    });
+    tooSmallMsg = textOf(r);
+    tooSmallRejected = r?.isError === true;
+  } catch (e: any) {
+    tooSmallMsg = String(e?.message ?? e);
+    tooSmallRejected = true;
+  }
+  check("kb_route 降到底仍超预算时报错而不是硬塞", tooSmallRejected,
+    tooSmallMsg.slice(0, 150));
+  check("kb_route 此时给出「预算至少要给到多少」",
+    tooSmallMsg.includes("预算至少要给到"), tooSmallMsg.slice(0, 200));
+
+  // 4. 超预算默认拒绝（非零退出 → MCP 层是 isError）
+  let overBudgetRejected = false;
+  let overBudgetMsg = "";
+  try {
+    const r = await call("tools/call", {
+      name: "kb_route", arguments: { specPath, budget: 800 }
+    });
+    overBudgetMsg = textOf(r);
+    overBudgetRejected = r?.isError === true;
+  } catch (e: any) {
+    overBudgetMsg = String(e?.message ?? e);
+    overBudgetRejected = true;
+  }
+  check("kb_route 超预算默认拒绝装订", overBudgetRejected, overBudgetMsg.slice(0, 150));
+  check("kb_route 拒绝时给出每个成员的 tok 明细",
+    overBudgetMsg.includes("--degrade") && overBudgetMsg.includes("tok"),
+    overBudgetMsg.slice(0, 200));
+
+  // 5. 前缀归一：带仓库前缀与裸路径必须装出同样的东西
+  const prefixed = await call("tools/call", {
+    name: "kb_pack", arguments: { scope: "atomkgraph/apps/web/src/components/ui/", budget: 13000 }
+  });
+  const prefixedData = JSON.parse(textOf(prefixed));
+  check("kb_pack 带仓库前缀的目录能装出内容（曾恒为 0）",
+    prefixedData.total > 0, `total=${prefixedData.total}`);
+  check("kb_pack 带前缀与裸路径装订量一致",
+    prefixedData.total === bareDirData.total,
+    `prefixed=${prefixedData.total} bare=${bareDirData.total}`);
+  check("kb_pack 带前缀与裸路径块数一致",
+    (prefixedData.blocks ?? []).length === (bareDirData.blocks ?? []).length,
+    `prefixed=${(prefixedData.blocks ?? []).length} bare=${(bareDirData.blocks ?? []).length}`);
+
+  // 6. 单文件带前缀不许把落点文件当成自己的兄弟再装一遍
+  //
+  // 判据是「prio 有多块同文件」：落点本身是 prio 5，兄弟大纲是 prio 1。
+  // 早先的 bug 就表现为同一个文件既有 prio 5 全文、又有 prio 1 大纲（多付 43 tok）。
+  const onePrefixed = await call("tools/call", {
+    name: "kb_pack",
+    arguments: { scope: "atomkgraph/apps/web/src/components/ui/button.tsx", budget: 13000 }
+  });
+  const onePrefixedData = JSON.parse(textOf(onePrefixed));
+  const selfBlocks = (onePrefixedData.blocks ?? []).filter(
+    (b: any) => String(b.label).startsWith("apps/web/src/components/ui/button.tsx"));
+  check("kb_pack 单文件带前缀只装一块自己（不重复成兄弟大纲）",
+    selfBlocks.length === 1,
+    JSON.stringify(selfBlocks.map((b: any) => `prio${b.prio} ${b.label}`)));
+  check("kb_pack 那一块是 prio 5 全文（不是被降级成兄弟大纲）",
+    selfBlocks.length === 1 && selfBlocks[0].prio === 5,
+    JSON.stringify(selfBlocks.map((b: any) => `prio${b.prio}`)));
+
+  // 7. 选型规则的唯一来源是 git，不再有 .kbignore 这第二份清单。
+  //
+  // 实测出来的冲突：webview/ 的 8 个文件都已进 git，却被 repo/.kbignore
+  // 写成「不是源码」。dispatch 报「写范围 0 个代码文件」，而 route --around
+  // 又能看见它们——两条路径对同一批文件给出相反结论，正是双真值的代价。
+  const dispWeb = textOf(await call("tools/call", {
+    name: "kb_dispatch", arguments: { scopes: ["webview/"] }
+  }));
+  check("kb_dispatch 看得见 git 已跟踪的 webview 源码",
+    dispWeb.includes("webview/server.mjs") && dispWeb.includes("webview/data.mjs"),
+    dispWeb.slice(0, 220));
+  check("kb_dispatch 的 webview 写范围不是 0 个文件",
+    !dispWeb.includes("写范围 0 个代码文件"), dispWeb.slice(0, 220));
+
+  const packWeb = JSON.parse(textOf(await call("tools/call", {
+    name: "kb_pack", arguments: { scope: "webview/", budget: 20000 }
+  })));
+  check("kb_pack 装出了 webview 的源码（不再是 0 块）",
+    packWeb.total > 0 && (packWeb.blocks ?? []).some(
+      (b: any) => String(b.label).includes("webview/")),
+    `total=${packWeb.total} blocks=${(packWeb.blocks ?? []).length}`);
+
+  const aroundWeb = JSON.parse(textOf(await call("tools/call", {
+    name: "kb_route", arguments: { around: "webview/server.mjs", depth: 1 }
+  })));
+  check("kb_route around 解析出 .mjs 相对 import（server→data/sqlite）",
+    (aroundWeb.members ?? []).some((m: any) => m.path === "webview/data.mjs") &&
+    (aroundWeb.members ?? []).some((m: any) => m.path === "webview/sqlite.mjs"),
+    JSON.stringify((aroundWeb.members ?? []).map((m: any) => m.path)));
+
+  // 冒烟测试自己创建的文件自己删。否则每跑一次就留一个 _tmp_route_smoke.json，
+  // 而它写的路径是绝对路径，别人 clone 仓库后第一次跑就会看到「未跟踪文件」。
+  const { unlinkSync } = await import("node:fs");
+  try { unlinkSync(specPath); } catch { /* 已被删掉也无所谓 */ }
 
   // 模型分不清「代码路径」和「知识页路径」：它会 read 一个 .py。
   // 只说「不存在」它不会想到换工具（实测绕两圈），必须指出该用哪条命令。

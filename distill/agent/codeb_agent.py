@@ -45,6 +45,7 @@ from tools_fs import (  # noqa: E402
     ROOTS, read_file, read_file_range, list_dir, grep_text,
     edit_file, write_file, append_file, run_cmd, diff_summary,
     file_index, read_block, rollback_file, snap_list,
+    grep_count, find_line,
 )
 from context_cache import ContextCache  # noqa: E402
 from session_log import SessionLog, DualSink  # noqa: E402
@@ -157,6 +158,15 @@ class Task:
     # 默认 False：只把**结论**传给下游，过程丢掉——这就是「任务边界折叠」。
     # 下游真的需要细节时，leader 再单独派一个任务去读盘上的轨迹。
     persist: bool = False
+    # ---- 路由装订（替代 scope 的 pack）----
+    # 路由规格 JSON 路径。给了它就不走 `kb pack`，改走 `kb route --spec`：
+    # 成员集与每成员保真度（full/index/outline）由 leader 显式声明。
+    # 为什么需要：目录 pack 按「预算 ÷ 文件数」平分，实测 200k 预算下
+    # apps/web 43 个文件仍降级 19 个大文件（含 20k tok 的 QuestionPanel）。
+    route: str = ""
+    # 路由超预算时是否允许自动降档。默认 False：降一档答案就基于大纲而不是原文，
+    # 而它长得像装订成功——这类失败最难被发现。
+    route_degrade: bool = False
 
 
 # ===================================================================== 工具
@@ -179,6 +189,14 @@ def make_tools(t: Task, cache: "ContextCache | None" = None) -> list:
 
     def _g(pattern: str, path: str = ".", max_hits: int = 20) -> str:
         return grep_text(pattern, path, max_hits, root=t.repo)
+
+    def _gc(pattern: str, path: str = ".") -> str:
+        """直接返回命中条数——回答「有几个」用它。"""
+        return grep_count(pattern, path, root=t.repo)
+
+    def _fl(literal: str, path: str = ".") -> str:
+        """直接返回 文件:行号——回答「第几行」用它。"""
+        return find_line(literal, path, root=t.repo)
 
     def _fi(path: str) -> str:
         """给代码文件建函数级索引（只给目录，不给正文）。"""
@@ -216,6 +234,16 @@ def make_tools(t: Task, cache: "ContextCache | None" = None) -> list:
                       description_override="列目录（单层），带文件大小。"),
         function_tool(_g, name_override="grep_text",
                       description_override="在目录里搜字符串，返回 路径:行号:内容。找原文用它，不要凭记忆写 old。"),
+        # 这两个是「归约型」工具：直接给答案，不让模型自己数。
+        # 实测依据见 tools_fs.grep_count 的注释：给原料（grep 命中行）时
+        # 计数题 1/3，给条数时 3/3。
+        function_tool(_gc, name_override="grep_count",
+                      description_override=("正则搜索并**直接返回命中条数**。"
+                                             "问题问「有几个 / 多少条」时**必须用它**，"
+                                             "不要自己数 grep_text 的输出——实测模型数不准。")),
+        function_tool(_fl, name_override="find_line",
+                      description_override=("找一个字面量出现的 **文件:行号**。"
+                                             "问题问「在第几行 / 在哪」时**必须用它**，不要凭上下文里的行号猜。")),
         function_tool(_fi, name_override="file_index",
                       description_override=("给一个代码文件建**函数级索引**，每块一行 `函数名@行号:签名`。"
                                              "只给目录不给正文——先看索引定位，再用 read_block 取需要的函数。"
@@ -279,12 +307,28 @@ class Context:
 
 
 def assemble(t: Task) -> Context:
-    """复用 kb dispatch + kb pack，不重写组装逻辑。"""
+    """复用 kb dispatch + kb pack / kb route，不重写组装逻辑。
+
+    给了 `route` 就走路由装订：成员集 + 每成员保真度由 leader 的规格决定，
+    而不是「预算 ÷ 文件数」。目录装订在 200k 预算下仍会把 19 个大文件降级（实测），
+    所以「想看这些文件的原文」只能靠路由表达。
+    """
     ctx = Context(task=t)
     rc, d = _kb(["dispatch", t.scope])
     if rc != 0:
         raise RuntimeError(f"dispatch 失败：{d}")
     ctx.dispatch = d
+    if t.route:
+        # 路由规格里已经写死了 budget/成员，不再叠加 pack 的参数
+        argv = ["route", "--spec", t.route]
+        if getattr(t, "route_degrade", False):
+            argv.append("--degrade")
+        rc, k = _kb(argv)
+        if rc != 0:
+            raise RuntimeError(f"route 失败：{k}")
+        ctx.knowledge = k
+        ctx.tokens = kb.est_tokens(d) + kb.est_tokens(k)
+        return ctx
     argv = ["pack", t.scope, "--budget", str(t.budget)]
     if not t.with_source:
         argv.append("--no-source")
@@ -670,6 +714,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="轮次上限；默认不限。不要轻易设——任务该拆细，不是靠轮数掐断")
     r.add_argument("--no-cmd", action="store_true", help="不给 run_cmd 工具")
     r.add_argument("--note", default="", help="追加的静态上下文（契约/警告等）")
+    r.add_argument("--route", default="",
+                   help="路由规格 JSON 路径：改走 kb route --spec（成员集 + 每成员保真度）")
+    r.add_argument("--route-degrade", action="store_true",
+                   help="路由超预算时允许自动降档（默认拒绝）")
     r.add_argument("--persist", action="store_true", help="把完整执行轨迹落盘")
     r.add_argument("--json", action="store_true", help="输出 JSON")
 
@@ -749,6 +797,8 @@ def main(argv: list[str] | None = None) -> int:
             with_cmd=not args.no_cmd,
             note=args.note,
             persist=args.persist,
+            route=args.route,
+            route_degrade=args.route_degrade,
         )
         try:
             out = run_sync([t])
