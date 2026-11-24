@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>codeb 项目情况面板</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>codeb 项目情况面板</h1>
+    <span class="workspace" id="workspace">—</span>
+  </div>
+  <div class="header-actions">
+    <span class="source-badges" id="sourceBadges"></span>
+    <button id="refreshBtn" title="重新拉取数据">刷新</button>
+  </div>
+</header>
+
+<main>
+  <section class="kpis" id="kpis"></section>
+
+  <div class="workspace-grid">
+    <!-- 左侧：多级页表树 + 简介 -->
+    <section class="card tree-card">
+      <h2>多级页表 <span class="hint">点节点看详情与编辑</span></h2>
+      <div class="levels" id="levels"></div>
+      <div class="tree" id="tree"><div class="loading">加载中…</div></div>
+    </section>
+
+    <!-- 右侧：选中节点的详情（md 正文 + 编辑） -->
+    <section class="card detail-card">
+      <div class="detail-head">
+        <h2 id="detailTitle">详情 <span class="hint">选择一个节点</span></h2>
+        <div id="detailActions" class="detail-actions" style="display:none">
+          <button id="editBtn">编辑</button>
+          <button id="saveBtn" style="display:none">保存</button>
+          <button id="cancelBtn" style="display:none">取消</button>
+          <button id="rawBtn">打开文件</button>
+        </div>
+      </div>
+      <div class="detail-meta" id="detailMeta"></div>
+      <div id="detailView" class="detail-view">
+        <div class="empty">点击左侧项目 / 模块 / 部件节点，这里显示该层页表的完整内容（Markdown 原文），可手动编辑。</div>
+      </div>
+      <textarea id="detailEditor" class="detail-editor" style="display:none" spellcheck="false"></textarea>
+      <div id="detailMsg" class="detail-msg"></div>
+    </section>
+  </div>
+
+  <div class="grid lower">
+    <section class="card">
+      <h2>验证状态</h2>
+      <div id="verification" class="verification"></div>
+    </section>
+    <section class="card">
+      <h2>covers 自检 <span class="hint">人工声明 vs 磁盘源码</span></h2>
+      <div class="covers-tabs" id="coversTabs"></div>
+      <div class="covers-list" id="coversList"></div>
+    </section>
+    <section class="card">
+      <h2>Session 事件 <span class="hint" id="logMeta"></span></h2>
+      <div class="timeline" id="timeline"></div>
+    </section>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>

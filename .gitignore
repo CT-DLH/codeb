@@ -1,0 +1,95 @@
+# codeb 的 git 忽略规则
+#
+# 分工：
+#   .gitignore  决定「哪些文件进版本库」（本文件）
+#   .kbignore   决定「哪些文件算源码、进知识库索引」（在 repo/.kbignore）
+# 两者目的不同，不要合并：一个 .md 页要进版本库，但它不是「源码」。
+
+# ── 临时与派生（本机工作产物，不进版本库）──────────────────────────
+_kbwork/
+_tmp/
+.kbwork/
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+*.so
+
+# 虚拟环境
+agvenv/
+.venv/
+venv/
+ENV/
+env/
+site-packages/
+
+# 测试与工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ── Node ──────────────────────────────────────────────────────────
+node_modules/
+.npm/
+.pnpm-store/
+*.tsbuildinfo
+
+# ── 编辑器与系统 ──────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ── DSH 运行时生成 ────────────────────────────────────────────────
+# 由 DSH 自动写入的插件实例，不是本项目源码
+.dsh-created-plugins/
+.dsh/
+
+# ── 凭据与本地配置（绝不能提交）────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*secret*
+!**/secrets/**
+.credentials*
+
+# ── 本项目的派生数据 ──────────────────────────────────────────────
+# 知识库索引是派生产物，md 页才是真源（kb reindex 可从 md 重建）
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# 生成的报告与快照
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# ── 明确要提交的（覆盖上面的宽泛规则）────────────────────────────
+# package-lock.json 是依赖锁定，必须进版本库以保证可复现构建
+!**/package-lock.json
+!**/package.json
+
+# 仓库内的知识页是核心资产，永远提交
+!repo/**

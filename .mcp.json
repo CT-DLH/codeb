@@ -1,0 +1,13 @@
+{
+  "//": "通用 MCP 客户端配置（Claude Desktop / Cursor 等读取）。DSH 不读这个文件——DSH 用 ~/.dsh/profiles/desktop/cordis.patch.yml 的 mcp-codeb 条目。两处都留着是为了别的客户端能直接用。",
+  "mcpServers": {
+    "codeb": {
+      "command": "node",
+      "args": ["D:/work/project/codeb/mcp/server.ts"],
+      "cwd": "D:/work/project/codeb",
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}
