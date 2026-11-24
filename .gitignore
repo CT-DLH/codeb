@@ -93,3 +93,4 @@ desktop.ini
 
 # 仓库内的知识页是核心资产，永远提交
 !repo/**
+repo/
