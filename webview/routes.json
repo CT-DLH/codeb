@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "预设路由 LLM：每个路由管理一组路径下的全部源码，全部 full 整装。",
+    "leader 的上下文只预注入 name+desc+estimated_tokens，不注入成员清单。",
+    "leader 调用 ask_route(route=名字, question=问题)，成员由 paths 自动生成。",
+    "实测（2026-11-25，预算 100k，全部 full）：",
+    "  kernel  4 文件  76,110 tok（含 33 个自动关联知识块）",
+    "  agent  12 文件  55,041 tok（含 35 个知识块）",
+    "  distill 8 文件  55,836 tok",
+    "  webview 15 文件  80,484 tok（含前端 html/css 与 routes.json/models.json）",
+    "paths 是目录/文件 glob，新增文件会自动纳入；exclude 用于剔除噪音。"
+  ],
+  "budget": 100000,
+  "routes": [
+    {
+      "name": "kernel",
+      "desc": "内核与 MCP：kb.py 命令体系、pack/route/dispatch 装订、MCP 工具注册",
+      "paths": ["kb.py", "mcp/*.ts"],
+      "entry": "kb.py",
+      "est_tokens": 76110
+    },
+    {
+      "name": "agent",
+      "desc": "任务 agent：codeb_agent 调度、上下文换页缓存、工具层 tools_fs、子 agent 派发",
+      "paths": ["distill/agent/*"],
+      "exclude": ["distill/agent/package.json", "distill/agent/package-lock.json"],
+      "entry": "distill/agent/codeb_agent.py",
+      "est_tokens": 55041
+    },
+    {
+      "name": "distill",
+      "desc": "蒸馏管线：distill.py 四段流程、symtree/doctree/filedoc、projtree 目录树",
+      "paths": ["distill/*.py"],
+      "entry": "distill/distill.py",
+      "est_tokens": 55836
+    },
+    {
+      "name": "webview",
+      "desc": "对话面板：chat_engine 上下文与工具、chat-api SSE、前端 chat.html/chat.css/chat.js、服务端",
+      "paths": ["webview/*", "webview/public/*"],
+      "exclude": ["webview/start.bat", "webview/start.ps1", "webview/README.md"],
+      "entry": "webview/chat_engine.py",
+      "est_tokens": 80484
+    }
+  ]
+}

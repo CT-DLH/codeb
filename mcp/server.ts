@@ -35,9 +35,9 @@ interface RunResult {
  * 调用 Python 内核。参数一律走 argv，不拼 shell 字符串——
  * 知识库路径里有中文、空格、反斜杠，拼字符串是最容易出错的做法。
  */
-function runKb(args: string[]): Promise<RunResult> {
+function runPy(entry: string[], args: string[]): Promise<RunResult> {
   return new Promise((resolvePromise) => {
-    const child = spawn(process.env.KB_PYTHON || "python", [KB_PY, ...args], {
+    const child = spawn(process.env.KB_PYTHON || "python", [...entry, ...args], {
       cwd: PROJECT_ROOT,
       env: { ...process.env, PYTHONIOENCODING: "utf-8" },
       windowsHide: true
@@ -57,11 +57,20 @@ function runKb(args: string[]): Promise<RunResult> {
   });
 }
 
+/** 知识库内核（kb.py）与目录表内核（distill.projtree）两个入口。 */
+function runKb(args: string[]): Promise<RunResult> {
+  return runPy([KB_PY], args);
+}
+function runProj(args: string[]): Promise<RunResult> {
+  return runPy(["-m", "distill.projtree"], args);
+}
+
 /** 取 JSON 结果；非 0 退出码时把 stderr 作为错误抛出。 */
-async function kbJson<T = any>(args: string[]): Promise<T> {
-  const r = await runKb([...args, "--json"]);
+async function pyJson<T = any>(runner: (a: string[]) => Promise<RunResult>,
+                               args: string[], label: string): Promise<T> {
+  const r = await runner([...args, "--json"]);
   if (r.code !== 0) {
-    const msg = (r.stderr || r.stdout || "").trim() || `kb 退出码 ${r.code}`;
+    const msg = (r.stderr || r.stdout || "").trim() || `${label} 退出码 ${r.code}`;
     throw new Error(msg);
   }
   try {
@@ -70,6 +79,8 @@ async function kbJson<T = any>(args: string[]): Promise<T> {
     throw new Error(`内核返回了非 JSON 输出：${r.stdout.slice(0, 400)}`);
   }
 }
+const kbJson = <T = any>(args: string[]) => pyJson<T>(runKb, args, "kb");
+const projJson = <T = any>(args: string[]) => pyJson<T>(runProj, args, "projtree");
 
 /* ---------------------------------------------------------------- 工具定义 */
 
@@ -101,23 +112,47 @@ const REPO_SCHEMA = {
 
 const TOOLS: ToolDef[] = [
   {
-    name: "kb_tree",
+    name: "tree",
     description:
-      "下行浏览知识库：按目录折叠输出每页标题，成本约几十 token。会话开始时先调它，" +
-      "再决定读哪一页。返回 pages 与每页的 rel（相对 repo/ 的路径，可直接喂给 kb_read）。",
+      "通用的树形浏览工具，两棵树共用：\n" +
+      "  view=kb（默认）：知识库架构树——repo/ 下的 md 页，按目录折叠。" +
+      "会话开始先调它，再决定读哪页。\n" +
+      "  view=source：项目源码目录树——未被 gitignore、且非 repo/ 的源码文件，" +
+      "每个文件带一句话介绍和新鲜度（fresh/stale/none）。\n" +
+      "默认返回 kb 树，行为与旧的 kb_tree 一致。",
     inputSchema: {
       type: "object",
       properties: {
-        depth: { type: "number", description: "展开到第几层目录，默认 3" },
-        repo: REPO_SCHEMA
+        view: {
+          type: "string", enum: ["kb", "source"], default: "kb",
+          description: "看哪棵树：kb=知识库架构树（默认），source=源码目录树"
+        },
+        depth: { type: "number", description: "展开层数，kb 默认 3，source 默认 2" },
+        repo: REPO_SCHEMA,
+        path: {
+          type: "string",
+          description: "source 视图的子树路径，如 distill 或 distill/agent；缩小范围很重要（infohub 有 2.9 万文件）"
+        },
+        only: {
+          type: "string", enum: ["all", "stale", "missing"], default: "all",
+          description: "source 视图过滤：stale=介绍过期，missing=未写介绍"
+        }
       }
     },
     handler: async (a) => {
+      const view = a?.view === "source" ? "source" : "kb";
+      if (view === "source") {
+        const args = ["tree", ...(a?.path ? [String(a.path)] : [])];
+        args.push("--depth", String(a?.depth ?? 2));
+        if (a?.only && a.only !== "all") args.push("--only", String(a.only));
+        args.push("--nested");
+        return text(await projJson(args));
+      }
+      // kb 视图：与旧 kb_tree 逐字一致
       const args = ["tree"];
       if (a?.depth) args.push("--depth", String(a.depth));
       if (a?.repo) args.push("--repo", String(a.repo));
-      const data = await kbJson(args);
-      return text(data);
+      return text(await kbJson(args));
     }
   },
   {

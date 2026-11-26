@@ -175,7 +175,8 @@ python kb.py upsert infohub/collector/l1-primitives --append --body "..."
 需要 Node 24+（能直接跑 `.ts`，**没有构建步骤**）。
 Python 解释器默认取 `python`，可用环境变量 `KB_PYTHON` 覆盖。
 
-工具清单：`kb_tree` / `kb_read` / `kb_heads` / `kb_search` / `kb_where` / `kb_upsert`。
+工具清单：`tree`（通用树，view=kb 架构树 / view=source 源码目录树）/ `kb_read` / `kb_heads` / `kb_search` / `kb_where` / `kb_upsert`。
+`tree` 的 kb 视图即旧的 `kb_tree`，默认视图不变。
 
 ## 收割历史会话（distill/）
 
@@ -223,7 +224,7 @@ node mcp/smoke.ts      # 75 项断言，走真实 stdio 协议，跑完自己清
 ## 调用顺序（重要）
 
 ```text
-1. kb_tree                看清全库（约 971 tok）
+1. tree（view=kb）        看清全库（约 971 tok）；看源码目录用 tree view=source
 2. kb_where <源码路径>     这次要改的东西归谁管？
 3. 有命中 → kb_read <页> --section    确认现有内容
    无命中 → kb_read <最相关的页>       看邻居怎么写的

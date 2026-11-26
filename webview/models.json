@@ -1,0 +1,46 @@
+{
+  "_comment": "codeb 对话可选模型清单。手工维护，可自由增删改。",
+  "_fields": {
+    "id": "传给 API 的 model 名（必填）",
+    "label": "下拉菜单显示的名字（缺省用 id）",
+    "note": "一句话说明，显示在下拉项右侧",
+    "recommended": "是否标为推荐（true 时显示星标）",
+    "context_window": "上下文窗口 tokens（仅作展示，不参与计算）"
+  },
+  "_measured": [
+    "以下数字来自 repo/codeb/route-packs 页的实测，不是厂商宣传值：",
+    "super-vl-120b：两道事实题 2/2（28 / 106），都正确调用了 grep_count / find_line",
+    "lightning-30b：两道都错（11 / 163），而且一次工具都没调，错得很自信"
+  ],
+  "default": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+  "models": [
+    {
+      "id": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+      "label": "Nemotron 3.5 Super VL 120B",
+      "note": "实测事实题 2/2，会正确调工具。默认用它",
+      "recommended": true,
+      "context_window": 131072
+    },
+    {
+      "id": "nvidia/nemotron-3.5-lightning-30b-a3b",
+      "label": "Nemotron 3.5 Lightning 30B",
+      "note": "实测事实题 0/2 且不调工具。只用来对比速度",
+      "recommended": false,
+      "context_window": 131072
+    },
+    {
+      "id": "deepseek-ai/deepseek-v3.1",
+      "label": "DeepSeek V3.1",
+      "note": "未在本项目实测过工具调用表现",
+      "recommended": false,
+      "context_window": 131072
+    },
+    {
+      "id": "qwen/qwen3-coder-480b-a35b-instruct",
+      "label": "Qwen3 Coder 480B",
+      "note": "未在本项目实测过",
+      "recommended": false,
+      "context_window": 262144
+    }
+  ]
+}

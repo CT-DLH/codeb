@@ -42,7 +42,15 @@ DENY_PATTERNS = [
 
 
 def resolve(path: str, root: str) -> Path | None:
-    """把 agent 给的相对路径解析到某个仓库根下；跨根或越界返回 None。"""
+    """把 agent 给的相对路径解析到某个仓库根下；跨根或越界返回 None。
+
+    **接受带仓库名前缀的路径**。实测模型会把看到的路由包标题（`codeb/xxx`）
+    当成路径前缀写进工具参数（写成 `codeb/webview/chat_engine.py`），
+    早先这里会把它解析成 `<root>/codeb/webview/...` —— 文件不存在，
+    而 read_file 对不存在的路径只返回一行提示，模型看不出是自己写错了，
+    于是反复加大 max_lines 重试同一个不存在的文件（实测连撞 12 轮）。
+    所以这里宽容地剥掉多余的那层仓库名。
+    """
     base = ROOTS.get(root)
     if base is None:
         return None
@@ -54,6 +62,11 @@ def resolve(path: str, root: str) -> Path | None:
             return p.resolve()
         except ValueError:
             return None
+    # 剥掉多余的仓库名前缀：`codeb/a.py` 在 root=codeb 下落成 `a.py`
+    parts = p.parts
+    while len(parts) > 1 and parts[0] == root:
+        parts = parts[1:]
+    p = Path(*parts) if parts else p
     target = (base / p).resolve()
     try:
         target.relative_to(base.resolve())
@@ -177,6 +190,29 @@ def read_block(path: str, key: str, root: str = "infohub") -> str:
             f"{block['kind']}，解析器={parser}）\n{body}")
 
 
+def _not_found_msg(path: str, root: str, base: Path) -> str:
+    """文件不存在时说人话，并给候选路径。
+
+    早先只返回一行「文件不存在：xxx」，模型看不出自己把路径写错了，
+    于是反复重试（实测连撞 12 轮，每次都加大 max_lines）。
+    错误信息必须**可操作**：指出仓库根在哪、给出名字相近的真实文件。
+    """
+    want = Path(path).name
+    try:
+        cands = sorted(
+            (p.relative_to(base).as_posix() for p in base.rglob(want)
+             if p.is_file() and "node_modules" not in p.parts
+             and ".git" not in p.parts),
+        )[:5]
+    except OSError:
+        cands = []
+    msg = (f"文件不存在：{path}（仓库 {root}，根目录 {base.as_posix()}）。"
+           f"路径是相对于仓库根的，不要带仓库名前缀。")
+    if cands:
+        msg += "\n同名文件在这些位置：\n" + "\n".join(f"  - {c}" for c in cands)
+    return msg
+
+
 def read_file(path: str, max_lines: int = 150, root: str = "infohub") -> str:
     """读一个文件，返回前 max_lines 行，并附总行数。
 
@@ -186,7 +222,7 @@ def read_file(path: str, max_lines: int = 150, root: str = "infohub") -> str:
     if p is None:
         return f"路径越界或不存在：{path}（仓库 {root}）"
     if not p.exists():
-        return f"文件不存在：{path}"
+        return _not_found_msg(path, root, ROOTS[root])
     if p.is_dir():
         return f"{path} 是目录，不是文件（用 list_dir 看）"
     try:
@@ -204,11 +240,79 @@ def read_file_range(path: str, offset: int, limit: int = 150, root: str = "infoh
     if p is None:
         return f"路径越界或不存在：{path}（仓库 {root}）"
     if not p.exists():
-        return f"文件不存在：{path}"
+        return _not_found_msg(path, root, ROOTS[root])
     lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     start = max(1, offset)
     chunk = lines[start - 1: start - 1 + limit]
     return f"{path} 第 {start}-{start + len(chunk) - 1} 行（共 {len(lines)} 行）\n" + "\n".join(chunk)
+
+
+def read_constant(path: str, name: str, root: str = "infohub") -> str:
+    """精确读出模块级常量/配置的值。**不要让模型自己从源码里抄数字。**
+
+    起因是实测：问「FOLD_ROUNDS 里 ask_route 的值是多少」，模型读对了
+    文件、读对了位置，却把 `-1` 答成 `3`。位置对、值错——这是最危险的
+    错误形态，因为看起来像有依据。
+
+    「某个常量的值是多少」是个确定性查询，用 ast.literal_eval 取真值
+    比让模型转录可靠得多。非字面量（如 `= f()`）返回源码片段，并标明
+    它不是字面量，避免模型把它当确定值引用。
+    """
+    import ast
+
+    p = resolve(path, root)
+    if p is None:
+        return f"路径越界或不存在：{path}（仓库 {root}）"
+    if not p.exists():
+        return _not_found_msg(path, root, ROOTS[root])
+    if p.is_dir():
+        return f"{path} 是目录，不是文件"
+    try:
+        src = p.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"读取失败：{type(e).__name__}: {e}"
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as e:
+        return f"解析失败（{path}）：第 {e.lineno} 行 {e.msg}"
+
+    hits: list[tuple[int, str, str]] = []
+    for node in tree.body:          # 只找模块级，函数内的局部常量不在此列
+        targets: list[str] = []
+        value_node = None
+        if isinstance(node, ast.Assign):
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            value_node = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets = [node.target.id]
+            value_node = node.value
+        if name not in targets or value_node is None:
+            continue
+        try:
+            val = ast.literal_eval(value_node)
+            hits.append((node.lineno, type(val).__name__, repr(val)))
+        except (ValueError, SyntaxError):
+            snippet = ast.get_source_segment(src, value_node) or "?"
+            hits.append((node.lineno, "非字面量（需读上下文才能确定）", snippet))
+
+    if not hits:
+        # 没找到时给个线索：文件里有没有名字相近的常量
+        near = []
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                ts = ([t.id for t in node.targets if isinstance(t, ast.Name)]
+                      if isinstance(node, ast.Assign)
+                      else [node.target.id] if isinstance(node.target, ast.Name) else [])
+                for t in ts:
+                    if name.lower() in t.lower() or t.lower() in name.lower():
+                        near.append(f"{t}（第 {node.lineno} 行）")
+        msg = f"{path} 里没有名为 {name} 的模块级常量"
+        if near:
+            msg += "\n名字相近的有：" + "、".join(near[:6])
+        return msg
+
+    return "\n".join(f"{path}:{ln}  {name} = {val}   （类型 {kind}）"
+                     for ln, kind, val in hits)
 
 
 def list_dir(path: str = ".", pattern: str = "*", root: str = "infohub") -> str:
@@ -251,6 +355,25 @@ def resolve_loose(path: str, root: str) -> tuple[Path | None, str]:
     base = ROOTS.get(root)
     if base is None:
         return None, ""
+    # 退化 0：path 就是仓库名本身（或带仓库名前缀）。
+    # 实测模型会写 `path: "codeb"` 表示「整个仓库」——它看到目录树标题写着
+    # `codeb/`，就把仓库名当成了路径。严格解析返回「路径不存在」，
+    # 模型接着换成 `.`、`/`、`src` 乱试。**这是工具该吃的输入，不是模型的错。**
+    normed = path.strip().replace("\\", "/").strip("/")
+    if normed in (root, "", "."):
+        return base, f"（`{path}` 指的是整个仓库 {root}，已按仓库根搜索）"
+    for other in ROOTS:
+        if normed == other:
+            return None, (f"`{path}` 是另一个仓库（{other}），本次会话只在 {root} 内检索。"
+                          f"如果想看 {other}，请新建一个 repo={other} 的会话。")
+        if normed.startswith(other + "/"):
+            rest = normed[len(other) + 1:]
+            if other == root:
+                cand = base / rest
+                if cand.exists():
+                    return cand, f"（已剥掉仓库前缀 `{other}/`：{rest}）"
+            else:
+                return None, (f"`{path}` 属于仓库 {other}，本次会话只在 {root} 内检索。")
     # 退化 1：把 path 当 basename，在仓库里找同名文件
     name = Path(path).name
     if not name:
@@ -402,6 +525,54 @@ def grep_count(pattern: str, path: str = ".", root: str = "infohub",
     if n == 0:
         return head + (f"\n（没有命中 `{pattern}`。检查是否含不该有的正则元字符，"
                        "或换个路径）")
+
+    # ---- 直接给「代码行 vs 注释/文档行」的归类计数 ----
+    # 为什么必须由工具算：实测问「有几处调用了 X」时，模型拿到 40 条原始命中后
+    # 会自己判定「24 处是实际调用」，而同一份数据上一次它说 20 处——
+    # **让模型分类，等于没分类**。工具多算一个字段，答案就唯一了。
+    #
+    # 判据用**逐行状态机**而不是「行首像不像注释」：Python 多行 docstring
+    # 的中间行（`    it counts tokens.`）不以任何注释符号开头，
+    # 只看行首会把整段文档算成代码。
+    code_n, comment_n = 0, 0
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        in_triple = ""          # 当前所在的三引号定界符（"" 表示不在块内）
+        for line in text.splitlines():
+            hit = bool(rx.search(line)) if rx else (pattern in line)
+            stripped = line.lstrip()
+
+            # 先判断这一行**开头**是否处于注释/文档状态
+            is_comment_line = bool(in_triple) or (
+                stripped.startswith("#") or stripped.startswith("//")
+                or stripped.startswith("--") or stripped.startswith("*")
+                or stripped.startswith('"""') or stripped.startswith("'''"))
+
+            if hit:
+                if is_comment_line:
+                    comment_n += 1
+                else:
+                    code_n += 1
+
+            # 再更新三引号状态（同一行可能既开又关）
+            for q in ('"""', "'''"):
+                cnt = line.count(q)
+                if cnt:
+                    if in_triple == q:
+                        if cnt % 2 == 1:
+                            in_triple = ""
+                        else:
+                            pass                # 偶数个：开了又关，状态不变
+                    elif in_triple == "":
+                        if cnt % 2 == 1:
+                            in_triple = q
+    if n > 0:
+        head += (f"\n（其中代码行 {code_n} 条、注释/文档行 {comment_n} 条——"
+                 f"这是工具数的，不要自己重新分类）")
+
     return head + "\n" + "\n".join(where) + (
         f"\n…还有 {n - len(where)} 条未列出" if n > len(where) else "")
 
@@ -626,7 +797,11 @@ def run_cmd(cmd: str, root: str = "infohub", cwd: str = ".",
         return f"cwd 越界：{cwd}"
     # Windows 上用 shell 启动，让 node/npx/pnpm 能找到
     try:
+        # stdin=DEVNULL：命令不该有机会读走主进程的 stdin。
+        # 工具层是被管道化宿主调用的（webview / MCP），那根 stdin 上是
+        # 下一条命令，被子进程读走就成了「莫名其妙少了一条指令」。
         r = subprocess.run(cmd, shell=True, cwd=str(work), capture_output=True,
+                           stdin=subprocess.DEVNULL,
                            text=True, encoding="utf-8", errors="replace",
                            timeout=timeout_sec)
     except subprocess.TimeoutExpired:

@@ -134,6 +134,8 @@ main { padding: 20px 22px; max-width: 1500px; margin: 0 auto; }
 .pt-kpi b { color: var(--text); font-size: 13px; margin-left: 4px; }
 .pt-kpi.warn b { color: var(--amber); }
 .pt-kpi.ok b { color: var(--green); }
+.pt-kpi.tok { border-color: #3d4a6b; background: #1a2340; }
+.pt-kpi.tok b { color: var(--accent); font-family: Consolas, monospace; }
 .pt-tree { max-height: 520px; overflow: auto; font-family: Consolas, "Microsoft YaHei", monospace;
   font-size: 12px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
 .pt-tree details { margin: 1px 0; }

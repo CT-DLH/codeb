@@ -61,6 +61,42 @@ export function readIndex(root) {  if (!DatabaseSync) return null
 }
 
 /**
+ * 复刻 kb.py 的 est_tokens：CJK 字符 1 tok，其余每 3.5 字符 1 tok，向上取整。
+ * 口径必须与 CLI / MCP 一致，否则前端显示的数字和 agent 实际消耗对不上。
+ */
+export function estTokens(text) {
+  const cjk = (text.match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff]/g) || []).length
+  return Math.ceil(cjk + (text.length - cjk) / 3.5)
+}
+
+function fmtSize(n) {
+  if (n == null) return ''
+  if (n < 1024) return `${n}B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}K`
+  return `${(n / 1024 / 1024).toFixed(1)}M`
+}
+
+/**
+ * 模拟「把整个目录表按树形文本注入 prompt」时的真实文本，
+ * 格式与 `projtree tree` 的文本输出一致：缩进 + 路径 + 介绍 + 状态。
+ * 深度由 path 里的 / 数决定（readProjTree 返回的是整库，未指定子树）。
+ */
+export function renderInjectText(nodes, repo) {
+  const sorted = [...nodes].sort((a, b) => a.path.localeCompare(b.path, 'zh-CN'))
+  const lines = [repo]
+  for (const n of sorted) {
+    const depth = n.path.split('/').length - 1
+    let line = '  '.repeat(depth + 1) + n.name + (n.isDir ? '/' : '')
+    if (n.size != null) line += `  (${fmtSize(n.size)})`
+    if (n.purpose) line += `  — ${n.purpose}`
+    if (n.state === 'stale') line += '  ⚠过期'
+    else if (n.state === 'none' && !n.isDir) line += '  ·未写'
+    lines.push(line)
+  }
+  return lines.join('\n')
+}
+
+/**
  * 目录表：project_files（扫描生成的结构） + file_notes（LLM/agent 写的介绍）。
  *
  * 两张表是分开的，这里只读。每个文件带上 noteState：
@@ -82,8 +118,11 @@ export function readProjTree(root, repo = null) {
     }
     if (!has('project_files')) return null
 
+    // 只数文件，不数目录节点：798 是「762 文件 + 36 目录」的行数，
+    // 拿它当文件数会让人以为 codeb 有 798 个文件（实际只有 762）。
     const repos = db.prepare(
-      'SELECT repo, COUNT(*) AS n FROM project_files GROUP BY repo ORDER BY repo').all()
+      'SELECT repo, SUM(CASE WHEN is_dir=0 THEN 1 ELSE 0 END) AS n ' +
+      'FROM project_files GROUP BY repo ORDER BY repo').all()
       .map((r) => ({ repo: r.repo, count: Number(r.n) }))
     const want = repo || (repos[0] && repos[0].repo)
     if (!want) return { repos, repo: null, nodes: [], stats: null }
@@ -148,8 +187,35 @@ export function readProjTree(root, repo = null) {
       if (r) scan = { id: r.scan_id, method: r.method, ms: Number(r.elapsed_ms) }
     } catch { /* scan_log 不存在时忽略 */ }
 
-    return { repos, repo: want, nodes, orphans, stats, scan, live: true,
-             source: 'sqlite' }
+    // 注入成本：模拟把整个目录表按树形文本塞进 prompt，口径同 kb.est_tokens。
+    // 三档口径，避免「加介绍反而更少」这种反直觉显示：
+    //   tokens        完整树 = 缩进树 + 介绍 + 状态标记（agent 实际看到的）
+    //   tokensTree    仅树 = 缩进 + 文件名/目录名，不含介绍和大小
+    //   tokensPaths   仅路径清单 = 每行一个完整相对路径（另一种常见注入方式）
+    // 三者覆盖不同注入方式，让人知道「换种格式能省多少」。
+    const injectText = renderInjectText(nodes, want)
+    const tokens = estTokens(injectText)
+    const treeLines = [want]
+    for (const n of nodes) {
+      const depth = n.path.split('/').length - 1
+      treeLines.push('  '.repeat(depth + 1) + n.name + (n.isDir ? '/' : ''))
+    }
+    const tokensTree = estTokens(treeLines.join('\n'))
+    const pathLines = [want, ...nodes.map((n) => n.path)]
+    const tokensPaths = estTokens(pathLines.join('\n'))
+    const tokenStats = {
+      tokens,                                  // 完整树 + 介绍 + 状态
+      tokensTree,                              // 仅树形结构
+      tokensPaths,                             // 仅路径清单
+      chars: injectText.length,
+      files: files.length,
+      noted: files.filter((n) => n.purpose).length,
+      perFile: files.length ? Math.round(tokens / files.length) : 0,
+      model: 'kb.est_tokens（CJK 1tok/字，其余 3.5字符/tok）',
+    }
+
+    return { repos, repo: want, nodes, orphans, stats, scan,
+             tokens: tokenStats, live: true, source: 'sqlite' }
   } catch {
     return null
   } finally {

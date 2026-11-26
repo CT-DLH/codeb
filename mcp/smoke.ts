@@ -99,15 +99,26 @@ async function main(): Promise<void> {
   const list = await call("tools/list");
   const names: string[] = (list?.tools ?? []).map((t: any) => t.name).sort();
   check("tools/list 返回 9 个工具", names.length === 9, `实际 ${names.length}: ${names}`);
-  for (const want of ["kb_tree", "kb_read", "kb_heads", "kb_search", "kb_where",
+  for (const want of ["tree", "kb_read", "kb_heads", "kb_search", "kb_where",
                       "kb_pack", "kb_dispatch", "kb_upsert", "kb_route"]) {
     check(`工具有 ${want}`, names.includes(want));
   }
+  check("旧名 kb_tree 已移除", !names.includes("kb_tree"));
 
-  const tree = await call("tools/call", { name: "kb_tree", arguments: {} });
+  // tree 默认视图 = kb：输出须与旧 kb_tree 逐字一致
+  const tree = await call("tools/call", { name: "tree", arguments: {} });
   const treeData = JSON.parse(textOf(tree));
-  check("kb_tree 有页面", treeData.stats.pages > 0, `pages=${treeData.stats.pages}`);
-  check("kb_tree 按目录折叠", treeData.items[0].rel.includes("/"));
+  check("tree(kb) 有页面", treeData.stats.pages > 0, `pages=${treeData.stats.pages}`);
+  check("tree(kb) 按目录折叠", treeData.items[0].rel.includes("/"));
+
+  // tree 的 source 视图：源码目录树，嵌套结构，不含 repo/
+  const srcTree = await call("tools/call", {
+    name: "tree", arguments: { view: "source", depth: 1 }
+  });
+  const srcData = JSON.parse(textOf(srcTree));
+  check("tree(source) 是嵌套树", srcData.view === "source" && Array.isArray(srcData.tree));
+  check("tree(source) 不含 repo/", !JSON.stringify(srcData.tree).includes('"repo/"'));
+  check("tree(source) 有文件", (srcData.files ?? 0) > 0, `files=${srcData.files}`);
 
   // 层级正确性只能从文本输出验证：JSON 里没有父子结构。
   // 曾经的缺陷是 `codeb/design/` 被印在 `infohub/` 块下面——所有 rel 都合法，
@@ -506,7 +517,7 @@ async function main(): Promise<void> {
   // 后两个尤其危险：空结果本身是合法答案，前提只是仓库名拼对了。
   // 实测一个判断类任务因此白烧 4 轮（模型反复换工具重试）。
   for (const cmd of ["tree", "where", "search"]) {
-    const args: any = { name: "kb_tree", arguments: { repo: "collector/kit" } };
+    const args: any = { name: "tree", arguments: { repo: "collector/kit" } };
     if (cmd === "where") args.name = "kb_where", args.arguments = { path: "x.py", repo: "nope" };
     if (cmd === "search") args.name = "kb_search", args.arguments = { term: "kb", repo: "nope" };
     if (cmd === "tree") args.arguments = { repo: "collector/kit" };

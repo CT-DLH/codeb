@@ -12,6 +12,10 @@ const fmtTime = (ts) => {
 let PAYLOAD = null
 let coversTab = 'stale'
 
+// 项目目录表状态。infohub 有 2.9 万个节点，不能一次全渲染成 DOM，
+// 所以用「内存里放全量、展开时才渲染直接子节点」的懒渲染。
+const PT = { data: null, repo: null, filter: 'all', search: '', children: null, byPath: null }
+
 function toast(msg) {
   const t = $('toast')
   t.textContent = msg
@@ -324,6 +328,193 @@ function renderTimeline(p) {
     : '<div class="empty">无事件（跑了 agent 任务后会出现）</div>'
 }
 
+// ---------- 项目目录表 ----------
+function ptBuildIndex(t) {
+  const byPath = new Map()
+  const children = new Map()
+  for (const n of t.nodes || []) {
+    byPath.set(n.path, n)
+    const par = n.parent || ''
+    if (!children.has(par)) children.set(par, [])
+    children.get(par).push(n)
+  }
+  // 目录在前，文件在后；再按名字排
+  for (const arr of children.values()) {
+    arr.sort((a, b) => (b.isDir - a.isDir) || a.name.localeCompare(b.name, 'zh-CN'))
+  }
+  PT.byPath = byPath
+  PT.children = children
+}
+
+function ptVisible(n) {
+  if (PT.filter === 'stale' && !(n.state === 'stale')) return false
+  if (PT.filter === 'missing' && n.isDir) return false
+  if (PT.filter === 'missing' && n.state !== 'none') return false
+  if (PT.filter === 'noted' && (n.isDir || !n.purpose)) return false
+  if (PT.search) {
+    const q = PT.search.toLowerCase()
+    const hay = (n.path + ' ' + (n.purpose || '')).toLowerCase()
+    if (!hay.includes(q) && !String(n.path).toLowerCase().includes(q)) return false
+  }
+  return true
+}
+
+function ptHasVisibleDesc(path, seen = new Set()) {
+  if (seen.has(path)) return false
+  seen.add(path)
+  const kids = PT.children.get(path) || []
+  for (const k of kids) {
+    if (ptVisible(k)) return true
+    if (k.isDir && ptHasVisibleDesc(k.path, seen)) return true
+  }
+  return false
+}
+
+function ptStateHtml(n) {
+  if (n.isDir) return ''
+  if (n.state === 'stale') return '<span class="pt-state stale">过期</span>'
+  if (n.state === 'fresh' && n.purpose) return '<span class="pt-state fresh">新鲜</span>'
+  return '<span class="pt-state none">未写</span>'
+}
+
+function ptSize(size) {
+  if (size == null) return ''
+  if (size < 1024) return `<span class="pt-size">${size}B</span>`
+  if (size < 1024 * 1024) return `<span class="pt-size">${(size / 1024).toFixed(1)}K</span>`
+  return `<span class="pt-size">${(size / 1024 / 1024).toFixed(1)}M</span>`
+}
+
+function ptFileHtml(n) {
+  const ext = n.ext ? `<span class="pt-ext">${esc(n.ext)}</span>` : ''
+  const purpose = n.purpose
+    ? `<span class="pt-purpose" title="${esc(n.purpose)}">— ${esc(n.purpose)}</span>`
+    : ''
+  return `<div class="pt-file" data-path="${esc(n.path)}">
+    <span class="pt-name">${esc(n.name)}</span>${ext}${ptSize(n.size)}
+    ${ptStateHtml(n)}${purpose}</div>`
+}
+
+function ptDirHtml(n, depth) {
+  // 过滤模式下，若整个子树都不可见，这个目录本身也不显示
+  if ((PT.filter !== 'all' || PT.search) && !ptVisible(n) && !ptHasVisibleDesc(n.path)) {
+    return ''
+  }
+  const kids = PT.children.get(n.path) || []
+  const nKids = kids.length
+  if (!nKids) {
+    return `<div class="pt-file" data-path="${esc(n.path)}">
+      <span class="pt-name pt-dir">${esc(n.name)}/</span>
+      <span class="pt-purpose">（空目录）</span></div>`
+  }
+  return `<details data-ptpath="${esc(n.path)}" ${depth < 1 ? 'open' : ''}>
+    <summary><span class="pt-dir">${esc(n.name)}/</span>
+      <span class="pt-size">${nKids}</span></summary>
+    <div class="pt-children"></div></details>`
+}
+
+function ptRenderChildren(parent, box, depth) {
+  let kids = (PT.children.get(parent) || []).filter(ptVisible)
+  // 过滤模式下，把「自己不可见但后代可见」的目录也带上
+  if (PT.filter !== 'all' || PT.search) {
+    const extra = (PT.children.get(parent) || []).filter(
+      (k) => k.isDir && !kids.includes(k) && ptHasVisibleDesc(k.path))
+    kids = kids.concat(extra)
+    kids.sort((a, b) => (b.isDir - a.isDir) || a.name.localeCompare(b.name, 'zh-CN'))
+  }
+  if (!kids.length) {
+    box.innerHTML = '<div class="pt-empty">（无匹配项）</div>'
+    return
+  }
+  const html = kids.map((k) => k.isDir ? ptDirHtml(k, depth) : ptFileHtml(k)).join('')
+  box.innerHTML = html || '<div class="pt-empty">（无匹配项）</div>'
+}
+
+function renderProjTreeRoot() {
+  if (!PT.data || !PT.data.live) {
+    $('ptTree').innerHTML = '<div class="pt-empty">目录表未生成：先跑 python -m distill.projtree scan</div>'
+    $('ptRepos').innerHTML = ''
+    $('ptKpis').innerHTML = ''
+    return
+  }
+  const t = PT.data
+  if (!PT.repo || !t.repos.some((r) => r.repo === PT.repo)) {
+    PT.repo = t.repo || (t.repos[0] && t.repos[0].repo)
+  }
+  $('ptRepos').innerHTML = t.repos.map((r) =>
+    `<button data-repo="${esc(r.repo)}" class="${r.repo === PT.repo ? 'active' : ''}">${esc(r.repo)} (${r.count})</button>`).join('')
+  $('ptRepos').querySelectorAll('button').forEach((b) =>
+    b.addEventListener('click', () => {
+      PT.repo = b.dataset.repo
+      fetchJSON('/api/projtree?repo=' + encodeURIComponent(PT.repo)).then((d) => {
+        PT.data = d
+        ptBuildIndex(d)
+        renderProjTreeRoot()   // KPI（含 token）与仓库按钮也要跟着刷新
+      })
+    }))
+
+  const s = t.stats || {}
+  const tk = t.tokens || {}
+  const fmtTok = (n) => n == null ? '—' : n.toLocaleString('zh-CN')
+  $('ptKpis').innerHTML = `
+    <div class="pt-kpi">目录<b>${s.dirs ?? '—'}</b></div>
+    <div class="pt-kpi">文件<b>${s.files ?? '—'}</b></div>
+    <div class="pt-kpi ok">已写介绍<b>${s.noted ?? '—'}</b></div>
+    <div class="pt-kpi warn">过期<b>${s.stale ?? '—'}</b></div>
+    <div class="pt-kpi">未写<b>${s.missing ?? '—'}</b></div>
+    ${s.orphans ? `<div class="pt-kpi warn">孤儿<b>${s.orphans}</b></div>` : ''}
+    <div class="pt-kpi tok" title="整棵树含介绍+状态，注入 prompt 的估算成本">注入上下文<b>${fmtTok(tk.tokens)} tok</b></div>
+    <div class="pt-kpi tok" title="仅树形结构，无介绍">纯树形<b>${fmtTok(tk.tokensTree)} tok</b></div>
+    <div class="pt-kpi tok" title="每行一个完整路径">纯路径<b>${fmtTok(tk.tokensPaths)} tok</b></div>
+    <div class="pt-kpi tok" title="平均每文件">每文件<b>~${fmtTok(tk.perFile)} tok</b></div>`
+
+  renderProjTree()
+}
+
+// 给一批新创建的 <details> 绑定展开事件。
+// 关键：toggle 事件不冒泡，不能在容器上做事件委托；
+// 每次 ptRenderChildren 生成新的子目录后，必须对新节点再绑一次。
+// 之前只在 renderProjTree 里绑了顶层，所以点 agent/ 没反应。
+function ptBindDirs(scope) {
+  scope.querySelectorAll('details[data-ptpath]').forEach((d) => {
+    if (d.dataset.bound) return
+    d.dataset.bound = '1'
+    d.addEventListener('toggle', () => {
+      if (d.open) ptFillDir(d)
+    })
+    // 初始就 open 的目录不会可靠触发 toggle，主动填一次
+    if (d.open) ptFillDir(d)
+  })
+}
+
+function ptFillDir(d) {
+  const box = d.querySelector('.pt-children')
+  if (!box || box.dataset.loaded) return
+  box.dataset.loaded = '1'
+  ptRenderChildren(d.dataset.ptpath, box, 1)
+  // 新生成的子目录也要绑事件，否则点它们没反应
+  ptBindDirs(box)
+}
+
+function renderProjTree() {
+  $('ptTree').innerHTML = ''
+  ptRenderChildren('', $('ptTree'), 0)
+  ptBindDirs($('ptTree'))
+}
+
+function bindProjTree() {
+  $('ptFilters').querySelectorAll('button').forEach((b) =>
+    b.addEventListener('click', () => {
+      PT.filter = b.dataset.filter
+      $('ptFilters').querySelectorAll('button').forEach((x) =>
+        x.classList.toggle('active', x === b))
+      renderProjTree()
+    }))
+  $('ptSearch').addEventListener('input', (e) => {
+    PT.search = e.target.value.trim()
+    renderProjTree()
+  })
+}
+
 function render(p) {
   PAYLOAD = p
   renderHeader(p)
@@ -353,6 +544,15 @@ async function load() {
     }).catch(() => {
       $('coversList').innerHTML = '<div class="empty">covers 自检失败</div>'
     })
+    // 目录表按需单独取：它可能很大（infohub 2.9 万节点），不阻塞首屏。
+    fetchJSON('/api/projtree').then((d) => {
+      PT.data = d
+      PT.repo = d.repo || PT.repo
+      ptBuildIndex(d)
+      renderProjTreeRoot()
+    }).catch((e) => {
+      $('ptTree').innerHTML = `<div class="pt-empty">目录表加载失败：${esc(e.message)}</div>`
+    })
   } catch (e) {
     $('tree').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`
     toast('加载失败：' + e.message)
@@ -361,4 +561,5 @@ async function load() {
 
 $('refreshBtn').addEventListener('click', load)
 bindDetailActions()
+bindProjTree()
 load()

@@ -15,12 +15,16 @@
   所以只标记「过期」，由人和 agent 决定何时刷新。
   判定依据是 content_hash 与 note_hash 是否相等。
 
-文件口径（三层，优先级从高到低）：
+文件口径（选型唯一来源是 git，不读 .kbignore）：
   1. git ls-files --cached --others --exclude-standard   —— 有 .git 时最权威
-  2. .gitignore 解析（复用 kb.IgnoreRules）              —— 无 .git 时
+     取「已跟踪 + 未跟踪但未忽略」，进了 git 的就是重要的。
+  2. git 不可用时：扫整个项目（fs_files），仍跳过
+     node_modules / dist / .git / _kbwork 等依赖与产物目录。
   3. SRC_SKIP 内置集合                                   —— 永远兜底
-三层都要，因为实测 codeb 有 .gitignore 却没有 .git，
-而 infohub 两者都有；只认 git 会在 codeb 上直接失败。
+
+为什么不再有第二份规则文件：原先 repo/.kbignore 与 git 两份真值互相矛盾，
+实测 webview/ 8 个文件都进了 git，却被 .kbignore 排除，导致 dispatch 报
+「0 个代码文件」而 route --around 看得见它们。现在只认 git。
 """
 from __future__ import annotations
 
@@ -36,7 +40,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import kb  # noqa: E402  复用选型口径
 
-# 入表的扩展名。只存这些，避免把 infohub 的 4.6 万个文件全塞进来。
+# 入表的扩展名。含 .md：README.md / DESIGN.md / webview/README.md 是项目文档，
+# 属于源码目录的一部分，不能一刀切掉。
+# 但 repo/ 下的知识页是 kb 动态生成的输出，不是源码——由下面的 SKIP_TOP 单独排除。
 # --all 时不看这个集合。
 KEEP_EXTS = set(kb.CODE_EXT) | set(kb.CONF_EXT) | {
     ".md", ".ps1", ".sh", ".go", ".rs", ".java", ".kt", ".c", ".h",
@@ -44,7 +50,12 @@ KEEP_EXTS = set(kb.CODE_EXT) | set(kb.CONF_EXT) | {
     ".txt", ".cfg", ".ini", ".toml", ".sql",
 }
 
-# 这些即使「未被 gitignore」也不入库：运行时会话、机器状态
+# 只按「顶层目录名」排除，不是任意层级——
+# 否则项目里若有 src/repo/ 这类正常目录也会被误伤。
+#   repo   知识库输出（727 个 md，动态生成，有专门的工具在看）
+SKIP_TOP = {"repo"}
+
+# 这些「任意层级」的目录即使未被 gitignore 也不入库：运行时会话、缓存、机器状态
 EXTRA_SKIP = {".dsh-created-plugins", ".dsh", ".kbwork", ".mypy_cache",
               ".ruff_cache", ".pytest_cache", "__pycache__"}
 
@@ -152,6 +163,8 @@ def fs_files(root: Path) -> tuple[list[str], str]:
         parts = rel.split("/")
         if any(seg in kb.SRC_SKIP or seg in EXTRA_SKIP for seg in parts):
             continue
+        if parts[0] in SKIP_TOP:
+            continue
         if p.is_file():
             out.append(rel)
     return out, "fallback"
@@ -172,6 +185,7 @@ def enumerate_project(root: Path, use_git: bool = True,
         return files, method
     kept = [f for f in files
             if Path(f).suffix.lower() in KEEP_EXTS
+            and f.split("/")[0] not in SKIP_TOP
             and not any(seg in EXTRA_SKIP for seg in f.split("/"))]
     return kept, method
 
@@ -307,11 +321,55 @@ def _note_state(note_hash: str | None, content_hash: str | None,
     return "新鲜" if note_hash == content_hash else "过期"
 
 
+def nest_items(items: list[dict], base: str) -> list[dict]:
+    """把扁平 items 组装成嵌套树。
+
+    每个节点：{name, path, type, children?, purpose?, state?, size?}
+    目录行若被过滤掉，仍用文件路径中的段补出中间目录。
+    """
+    root: dict = {"children": {}}
+    for it in items:
+        rel = it["rel"].strip("/")
+        parts = [p for p in rel.split("/") if p]
+        cur = root
+        for i, seg in enumerate(parts):
+            is_last = i == len(parts) - 1
+            leaf = cur["children"].get(seg)
+            if leaf is None:
+                p = it["path"] if is_last else "/".join(
+                    ([base] if base else []) + parts[:i + 1])
+                leaf = {"children": {}, "_n": {
+                    "name": seg, "path": p, "type": "dir"}}
+                cur["children"][seg] = leaf
+            if is_last:
+                n = leaf["_n"]
+                n["type"] = "dir" if it["is_dir"] else "file"
+                if it.get("purpose"):
+                    n["purpose"] = it["purpose"]
+                if it.get("state"):
+                    n["state"] = it["state"]
+                if it.get("size") is not None and not it["is_dir"]:
+                    n["size"] = it["size"]
+            cur = leaf
+
+    def emit(node: dict) -> list[dict]:
+        out = []
+        for child in node["children"].values():
+            n = dict(child["_n"])
+            kids = emit(child)
+            if kids:
+                n["children"] = kids
+            out.append(n)
+        return out
+    return emit(root)
+
+
 def cmd_tree(root: Path, repo: str, sub: str, only: str, depth: int,
-             as_json: bool) -> int:
+             as_json: bool, nested: bool = False) -> int:
     conn = open_db(root)
     base = sub.strip("/")
     like = f"{base}/%" if base else "%"
+    # nested 输出由文件末尾统一处理，见 cmd_tree 的 as_json 分支
     rows = list(conn.execute(
         """select f.path,f.is_dir,f.size,f.content_hash,
                   n.purpose,n.note_hash,n.source
@@ -345,7 +403,16 @@ def cmd_tree(root: Path, repo: str, sub: str, only: str, depth: int,
                       "source": src})
 
     if as_json:
-        print(json.dumps(items, ensure_ascii=False, indent=2))
+        if nested:
+            out = {
+                "view": "source", "repo": repo, "base": base,
+                "tree": nest_items(items, base),
+                "count": len(items),
+                "files": sum(1 for i in items if not i["is_dir"]),
+            }
+        else:
+            out = items
+        print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
     if not items:
         print(f"{repo}/{base or ''} 无匹配项（过滤条件 --only {only}）")
@@ -483,6 +550,41 @@ def cmd_forget(root: Path, repo: str, path: str) -> int:
         print(f"{path} 没有介绍可删", file=sys.stderr)
         return 1
     print(f"已删除 {path} 的介绍")
+    return 0
+
+
+def cmd_clean(root: Path, repo: str, prefix: str | None, yes: bool) -> int:
+    """批量删孤儿介绍。默认列出不删，--yes 才执行。
+
+    孤儿通常是「文件被删」留下的，可能有价值（文件恢复后能复用），
+    所以默认不删。但当扫描口径改变（如把 repo/ 移出目录表）时，
+    会产生大批「本来就不该写」的介绍，此时用 --prefix repo/ 一次清掉。
+    """
+    conn = open_db(root)
+    sql = """select n.path from file_notes n
+               left join project_files f on f.repo=n.repo and f.path=n.path
+              where n.repo=? and f.path is null"""
+    args: list = [repo]
+    if prefix:
+        sql += " and n.path like ?"
+        args.append(prefix.rstrip("/") + "/%")
+    sql += " order by n.path"
+    rows = [r[0] for r in conn.execute(sql, args)]
+    if not rows:
+        print("没有匹配的孤儿介绍")
+        return 0
+    print(f"匹配 {len(rows)} 条孤儿介绍")
+    for p in rows[:8]:
+        print(f"  {p}")
+    if len(rows) > 8:
+        print(f"  ... 其余 {len(rows) - 8} 条")
+    if not yes:
+        print("\n这是预览。确认删除请加 --yes")
+        return 0
+    conn.executemany("delete from file_notes where repo=? and path=?",
+                     [(repo, p) for p in rows])
+    conn.commit()
+    print(f"已删除 {len(rows)} 条")
     return 0
 
 
@@ -672,6 +774,8 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--only", choices=["stale", "missing", "nodedoc"], default="",
                    help="stale=只看过期；missing=只看未写；nodedoc=只看没介绍的")
     t.add_argument("--json", dest="as_json", action="store_true")
+    t.add_argument("--nested", action="store_true",
+                   help="JSON 时输出嵌套树（供 MCP tree 工具用），默认扁平列表")
 
     n = sub.add_parser("note", help="写/改某个文件的介绍")
     n.add_argument("path")
@@ -693,6 +797,10 @@ def main(argv: list[str] | None = None) -> int:
     fl.add_argument("-v", "--verbose", action="store_true")
     f = sub.add_parser("forget", help="删除某条介绍")
     f.add_argument("path")
+    cl = sub.add_parser("clean", help="批量删除孤儿介绍")
+    cl.add_argument("--prefix", default=None,
+                    help="只删这个前缀下的，如 repo/；默认删全部孤儿")
+    cl.add_argument("--yes", action="store_true", help="确认执行（默认只预览）")
 
     args = ap.parse_args(argv)
     root = Path(args.root).resolve()
@@ -701,7 +809,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "scan":
         return cmd_scan(root, repo, not args.no_git, args.all, args.rehash)
     if args.cmd == "tree":
-        return cmd_tree(root, repo, args.sub, args.only, args.depth, args.as_json)
+        return cmd_tree(root, repo, args.sub, args.only, args.depth,
+                        args.as_json, args.nested)
     if args.cmd == "note":
         return cmd_set_note(root, repo, args.path, args.purpose,
                             args.detail, args.source, args.model)
@@ -712,6 +821,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "fill":
         return cmd_fill(root, repo, args.mode, args.limit, args.only,
                         args.force, args.verbose, args.model)
+    if args.cmd == "clean":
+        return cmd_clean(root, repo, args.prefix, args.yes)
     return cmd_forget(root, repo, args.path)
 
 

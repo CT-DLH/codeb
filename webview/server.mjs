@@ -21,6 +21,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import * as chatApiMod from './chat-api.mjs'
 import { buildNode, buildPayload, detectRoot, parseCovers, parseParts } from './data.mjs'
 import { readIndex, readProjTree } from './sqlite.mjs'
 
@@ -42,7 +43,18 @@ const STATIC = {
   '/index.html': ['index.html', 'text/html; charset=utf-8'],
   '/style.css': ['style.css', 'text/css; charset=utf-8'],
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
+  // ---- 对话面板（codeb 自己实现的 LLM 对话，UI 壳照 DSH 的暗色主题）----
+  '/chat': ['chat.html', 'text/html; charset=utf-8'],
+  '/chat.html': ['chat.html', 'text/html; charset=utf-8'],
+  '/chat.css': ['chat.css', 'text/css; charset=utf-8'],
+  '/chat.js': ['chat.js', 'text/javascript; charset=utf-8'],
 }
+
+// 对话 API：每个会话一个常驻 Python 引擎（见 chat-api.mjs）
+const chatApi = chatApiMod.createChatApi({
+  ROOT,
+  PY_SCRIPT: path.join(HERE, 'chat_engine.py'),
+})
 
 function send(res, code, body, type = 'application/json; charset=utf-8', cache = 'no-store') {
   res.writeHead(code, {
@@ -122,6 +134,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // 对话 API 优先（/api/chat*），交给 chat-api.mjs
+    if (url.pathname.startsWith('/api/chat')) {
+      const handled = await chatApi(req, res, url)
+      if (handled) return
+    }
+
     if (url.pathname === '/api/health') {
       return send(res, 200, JSON.stringify({ ok: true, root: ROOT, generatedAt: new Date().toISOString() }))
     }

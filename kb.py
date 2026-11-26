@@ -416,7 +416,7 @@ def pick_page(root: Path, target: str) -> Path | None:
         # 因为「读这个文件」和「读描述这个文件的页」在它看来是一件事。
         # 光说「不存在」它不会想到换工具——实测它会先去 kb_tree 绕两圈再回来。
         raw = norm(target)
-        if "/" in raw and Path(raw).suffix in SRC_EXT:
+        if "/" in raw and Path(raw).suffix:
             print(f"  这是一个代码路径，不是知识页：", file=sys.stderr)
             print(f"    看源码 + 相关知识：kb pack {raw}", file=sys.stderr)
             print(f"    只看相关知识：      kb pack {raw} --no-source", file=sys.stderr)
@@ -1231,6 +1231,12 @@ def git_files(base: Path) -> set[str] | None:
         r = subprocess.run(
             ["git", "-C", str(base), "ls-files",
              "--cached", "--others", "--exclude-standard", "-z"],
+            # **必须显式 DEVNULL**：不传的话子进程会继承父进程的 stdin。
+            # 当 kb 自己是被管道调用的（webview 的常驻子进程、MCP server、
+            # CI 里 `echo ... | kb pack`），那个 stdin 是永不关闭的管道，
+            # git 等它等到天荒地老——实测表现为「整个进程静默挂死，
+            # 不报错、不退出、没有输出」，栈停在 subprocess.communicate。
+            stdin=subprocess.DEVNULL,
             capture_output=True, timeout=60,
         )
     except (OSError, subprocess.SubprocessError):
@@ -1261,7 +1267,11 @@ def src_files(base: Path, rel: str, root: Path | None = None) -> list[str]:
 
     out: list[str] = []
     for f in sorted(d.rglob("*")):
-        if not f.is_file() or f.suffix not in SRC_EXT:
+        # 后缀不设白名单：git 已经决定了「什么是重要内容」，再按后缀筛
+        # 就是第二份清单。chat.css/chat.html 曾因此从目录树里消失——
+        # 问「侧边栏怎么折叠」时 leader 根本看不到前端文件。噪音交给
+        # SRC_SKIP 目录和 .gitignore，不要靠后缀猜「什么算源码」。
+        if not f.is_file():
             continue
         # d 已经是目标目录，f 必在 d 下，无需再做前缀过滤
         r = f.relative_to(base).as_posix()
@@ -1437,7 +1447,8 @@ def shallow_files(base: Path, rel: str, include_skip: bool = False) -> list[str]
     out = []
     try:
         for f in sorted(d.iterdir()):
-            if not f.is_file() or f.suffix not in SRC_EXT:
+            # 同上：不按后缀筛，否则派生物换个后缀就找不到了
+            if not f.is_file():
                 continue
             if not include_skip and f.name in CONF_SKIP_NAMES:
                 continue
@@ -1625,10 +1636,10 @@ def cmd_pack(root: Path, args) -> int:
     if total == 0 and not no_source:
         _err(f"装订结果是 0 块 / 0 tok：{scope}")
         if is_file:
-            _err(f"  这个文件存在（{target}），但抽不出任何内容——检查后缀是否在 SRC_EXT 里")
+            _err(f"  这个文件存在（{target}），但抽不出任何内容——检查它是否为空或读不出文本")
         elif not files:
-            _err(f"  目录存在（{target}），但按 SRC_EXT 没扫到任何源码文件。")
-            _err(f"  若里面有源码，检查它是否被 .gitignore 排除，或后缀是否在 SRC_EXT 里。")
+            _err(f"  目录存在（{target}），但没扫到任何文件。")
+            _err(f"  检查它是否被 .gitignore 排除，或全是二进制/产物。")
         return 2
 
     if args.json:
@@ -1771,7 +1782,8 @@ def _run_agent_proc(argv: list[str], as_json: bool, multi: bool) -> int:
     env = dict(os.environ)
     env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
-        r = subprocess.run(argv, capture_output=True, text=True,
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True,
                            encoding="utf-8", errors="replace", env=env)
     except OSError as e:
         _err(f"启动 agent 失败：{e}")
@@ -1842,7 +1854,8 @@ def _run_agent_proc(argv: list[str], as_json: bool, multi: bool) -> int:
     env = dict(os.environ)
     env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
-        r = subprocess.run(argv, capture_output=True, text=True,
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True,
                            encoding="utf-8", errors="replace", env=env)
     except OSError as e:
         _err(f"启动 agent 失败：{e}")
@@ -2200,6 +2213,39 @@ def cmd_route(root: Path, args) -> int:
         _err(f"（仓库 `{repo}` → {base}）")
         return 2
 
+    # --drop：点名去掉成员。错误提示里一直写着这个选项，但从未实现——
+    # 那是最糟的一种：**工具让你以为有这个出口，而出口是墙**。
+    # 只影响本次装订，不改规格文件（规格落的是意图，不是某一次的输出）。
+    dropped_members: list[str] = []
+    drop_args = [norm(x) for x in (getattr(args, "drop", None) or [])]
+    if drop_args:
+        keep: list[dict] = []
+        for m in members:
+            hit = None
+            for d in drop_args:
+                # 允许写全路径，也允许写带仓库前缀的
+                dn = d[len(repo) + 1:] if repo and d.startswith(repo + "/") else d
+                if m["path"] == dn or m["path"].endswith("/" + dn) or dn == m["path"]:
+                    hit = d
+                    break
+            if hit is None:
+                keep.append(m)
+            else:
+                dropped_members.append(m["path"])
+        unknown = [d for d in drop_args
+                   if not any(dm == d or dm.endswith(d.split("/")[-1])
+                              for dm in dropped_members)]
+        if len(keep) == len(members) or unknown:
+            _err(f"--drop 没匹配到任何成员：{', '.join(drop_args)}")
+            _err("现有成员：")
+            for m in members:
+                _err(f"  {m['path']}")
+            return 2
+        members = keep
+        if not members:
+            _err("--drop 把成员全部去掉了，没有可装订的内容。")
+            return 2
+
     # leader 预设的问题。必须尽早取出：JSON 输出里也要带上它，
     # 否则走 MCP 的 agent 看不到问题清单（那条路径只转发 JSON）。
     questions = [str(q) for q in (spec.get("questions") or []) if str(q).strip()]
@@ -2326,6 +2372,10 @@ def cmd_route(root: Path, args) -> int:
                          "tokens": (next((x.tokens for x in blocks
                                           if x.label.startswith(m["path"] + "  ")), 0))}
                         for m in members],
+            # --drop 去掉的成员：必须出现在输出里。
+            # 静默少装一个成员与「静默降一档」同样危险——包看着完整，
+            # 但 leader 点名的文件不在里面。
+            "dropped": dropped_members,
             "knowledge": [{"label": b.label, "tokens": b.tokens} for b in know_blocks],
             "degraded": degraded,
             "knowledge_dropped": [{"label": b.label, "tokens": b.tokens}
@@ -2342,6 +2392,11 @@ def cmd_route(root: Path, args) -> int:
     out = [f"# 路由包：{entry or repo}", ""]
     out.append(f"仓库 `{repo}` · 预算 {budget} · 实装 {total} tok · "
                f"{len(members)} 成员 / {len(know_blocks)} 知识节")
+    if dropped_members:
+        out.append("")
+        out.append(f"> ⚠ 按 `--drop` 去掉了 {len(dropped_members)} 个成员：")
+        for p in dropped_members:
+            out.append(f"> - `{p}`")
     if degraded:
         out.append("")
         out.append(f"> ⚠ **已降档 {len(degraded)} 个成员**（`--degrade`）："
@@ -3199,6 +3254,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"token 预算（默认取规格里的 budget，否则 {PACK_BUDGET}）")
     rt.add_argument("--degrade", action="store_true",
                     help="超预算时按 full→index→outline 降档（默认拒绝装订并报明细）")
+    rt.add_argument("--drop", action="append", default=[], metavar="PATH",
+                    help="点名去掉某个成员（可重复）。注意这只影响本次装订，"
+                         "不改规格文件——规格落的是意图")
     rt.add_argument("--ask", action="store_true",
                     help="装订后逐条提问（每问都是全新会话，共享同一份包前缀）")
     rt.add_argument("--q", action="append", default=[],
@@ -3305,7 +3363,10 @@ def main(argv: list[str] | None = None) -> int:
                 argv.append("--json")
             # 子进程直接继承 stdout/stderr：提问是给人看的流式长任务，
             # 中间结果不该被父进程收走再统一打印（会等到全部结束才见到任何字）。
-            return subprocess.call(argv, cwd=str(Path(__file__).resolve().parent))
+            # 但 stdin 要断开：否则 kb 被管道调用时，子进程会去抢父进程的
+            # stdin，两边读同一根管道，谁先读走谁就把对方的命令吃掉。
+            return subprocess.call(argv, cwd=str(Path(__file__).resolve().parent),
+                                   stdin=subprocess.DEVNULL)
         return cmd_route(root, args)
     return HANDLERS[args.cmd](root, args)
 
