@@ -7,8 +7,8 @@
      前端  → 只管渲染、会话切换、SSE 消费。零业务逻辑。
      后端  → chat-api.mjs 管进程，chat_engine.py 管上下文与 agent loop。
    
-   会话状态全部在前端内存 + 后端 Python 进程，不落盘。
-   刷新页面 = 新会话（刻意：避免旧上下文残留与新目录树同时在场）。
+   会话状态：前端内存 + 后端 Python 进程 + sqlite 落盘（webview/chat-store.mjs）。
+   刷新页面会从 sqlite 恢复会话列表与消息，点侧栏会话即可继续。
    ========================================================================== */
 
 const $ = (id) => document.getElementById(id)
@@ -23,9 +23,22 @@ const S = {
   models: [],            // 从 /api/chat/models 拉
   defaultModel: '',
   repos: [],             // 从 /api/chat/repos 拉（repo_roots 的磁盘视角）
+  cot: false,            // 是否让模型输出思考链（顶栏开关）
+  ctxMode: 'aggregated', // 上下文页签视图：aggregated | raw
 }
 
-const repo = 'codeb'
+/**
+ * 默认仓库：从 ?repo= 读（项目面板点「对话」时带过来），否则 codeb。
+ *
+ * 不读的话，从 infohub 面板进对话会静默问成 codeb——
+ * 界面在说「infohub 的对话」，装进上下文的却是别的项目。
+ */
+const repo = (() => {
+  const q = new URLSearchParams(location.search).get('repo')
+  return q || 'codeb'
+})()
+/** ?repo= 给了就锁定，切仓库入口禁用（见 repoBtn 的 onclick）。 */
+const LOCKED_REPO = !!new URLSearchParams(location.search).get('repo')
 const DEFAULT_TREE_DEPTH = 3
 
 /* ─────────────────────────────── 工具函数 */
@@ -193,6 +206,8 @@ function newSession(opts = {}) {
     files: opts.files || [],
     routeSpecs: opts.route_specs || [],
     custom: opts.custom || [],
+    cot: opts.cot ?? S.cot,
+    llmHistory: [],        // LLM 原始 history（含 tool_call_id），持久化用
   }
   S.sessions.unshift(s)
   S.activeId = id
@@ -231,6 +246,9 @@ async function deleteSession(id) {
       body: JSON.stringify({ session_id: id }),
     })
   } catch { /* 后端没起也无妨 */ }
+  try { await fetch('/api/chat/session', { method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id }) }) } catch { /* ignore */ }
   S.sessions.splice(i, 1)
   if (S.activeId === id) {
     S.activeId = S.sessions[0]?.id || null
@@ -260,7 +278,7 @@ function renderSessions() {
     del.title = '删除会话'
     del.onclick = (e) => { e.stopPropagation(); deleteSession(s.id) }
     item.append(title, del)
-    item.onclick = () => switchSession(s.id)
+    item.onclick = () => openSavedSession(s.id)
     box.append(item)
   }
 }
@@ -271,6 +289,29 @@ function msgNode(m) {
   const role = el('div', 'msg-role')
   role.textContent = m.role === 'user' ? '你' : 'AI'
   const body = el('div', 'msg-body')
+
+  // 思考链：可折叠，默认收起；照 DSH ReasoningRow 的形态。
+  if (m.cot) {
+    const row = el('details', 'cot-row' + (m.pending ? ' running' : ''))
+    const sum = el('summary')
+    const chev = el('span', 'cot-chevron')
+    chev.textContent = '▶'
+    const label = el('span', 'cot-label')
+    label.textContent = '思考'
+    const brief = el('span', 'cot-summary')
+    const first = (m.cot || '').split('\n').find((l) => l.trim()) || ''
+    brief.textContent = first.replace(/\*\*/g, '').slice(0, 80)
+    sum.append(chev, label, brief)
+    if (m.pending) {
+      const run = el('span', 'cot-running')
+      run.textContent = '思考中…'
+      sum.append(run)
+    }
+    const bodyEl = el('div', 'cot-body')
+    bodyEl.textContent = m.cot
+    row.append(sum, bodyEl)
+    body.append(row)
+  }
 
   if (m.tools && m.tools.length) {
     const wrap = el('div', 'tools')
@@ -295,10 +336,53 @@ function msgNode(m) {
   if (m.pending) text.insertAdjacentHTML('beforeend', '<span class="cursor"></span>')
   body.append(text)
 
+  // 每轮 token 用量（DSH TurnUsagePanel 的轻量版）
+  if (m.role === 'assistant' && m.usage && !m.pending) {
+    const bar = el('div', 'usage-bar')
+    const u = m.usage
+    const inTok = u.prompt_tokens ?? u.input_tokens
+    const outTok = u.completion_tokens ?? u.output_tokens
+    const reasonTok = (u.completion_tokens_details?.reasoning_tokens
+      ?? u.output_tokens_details?.reasoning_tokens)
+    const bits = []
+    if (inTok != null) bits.push(`输入 ${fmtTok(inTok)}`)
+    if (outTok != null) bits.push(`输出 ${fmtTok(outTok)}`)
+    if (reasonTok != null) bits.push(`思考 ${fmtTok(reasonTok)}`)
+    if (bits.length) {
+      const pill = el('span', 'usage-pill')
+      pill.textContent = bits.join(' · ')
+      bar.append(pill)
+    }
+    if (bar.childElementCount) body.append(bar)
+  }
+
   if (m.error) {
     const err = el('div', 'msg-error')
     err.textContent = m.error
     body.append(err)
+  }
+
+  // 消息操作行：复制 + 分支（对齐 DSH MessageIconActions）
+  if (!m.pending) {
+    const acts = el('div', 'msg-actions')
+    const copy = el('button', 'msg-act')
+    copy.textContent = '复制'
+    copy.title = '复制这条消息'
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(m.text || '')
+        copy.textContent = '已复制'
+        setTimeout(() => { copy.textContent = '复制' }, 1500)
+      } catch { toast('复制失败') }
+    }
+    acts.append(copy)
+    // 分支只在完成的 transcript 上可用（DSH 也是这条规则）
+    const branch = el('button', 'msg-act')
+    branch.textContent = '分支'
+    branch.title = '从这条消息分叉出新会话'
+    branch.onclick = () => branchFrom(m)
+    acts.append(branch)
+    body.append(acts)
   }
 
   node.append(role, body)
@@ -387,6 +471,58 @@ function scrollBottom() {
   requestAnimationFrame(() => { box.scrollTop = box.scrollHeight })
 }
 
+/* 原始态：真实发给 LLM 的 messages 数组，逐条原样展示。
+   与聚合态同源（都来自 context 事件），但这里**不分段、不排序、不省略**：
+   tool_calls / tool_call_id 都保留，折叠的占位符也照实际发出的显示。 */
+function renderContextRaw(s, raw, sum, list) {
+  for (const b of $('ctxModes').querySelectorAll('.ctx-mode')) {
+    b.classList.toggle('active', b.dataset.mode === 'raw')
+  }
+  if (!s || !raw || !raw.length) {
+    sum.innerHTML = ''
+    list.innerHTML = '<div class="traj-empty">发一条消息后显示原始 messages</div>'
+    return
+  }
+  const totalTok = raw.reduce((a, m) => a + (m.tokens || 0), 0)
+  const sysTok = raw.find((m) => m.role === 'system')?.tokens || 0
+  sum.innerHTML = `
+    <div class="ctx-kpi"><div class="v">${fmtTok(totalTok)}</div><div class="l">messages 合计</div></div>
+    <div class="ctx-kpi"><div class="v">${fmtTok(sysTok)}</div><div class="l">system</div></div>
+    <div class="ctx-kpi"><div class="v">${raw.length}</div><div class="l">条消息</div></div>
+    <div class="ctx-kpi"><div class="v">${s.ready ? '就绪' : '待初始化'}</div><div class="l">状态</div></div>`
+
+  list.innerHTML = ''
+  for (const m of raw) {
+    const card = el('div', 'raw-msg')
+    const head = el('div', 'raw-msg-head')
+    const idx = el('span', 'raw-idx')
+    idx.textContent = '#' + m.idx
+    const role = el('span', 'raw-role ' + (m.role || 'unknown'))
+    role.textContent = m.role || '?'
+    const note = el('span', 'raw-note')
+    if (m.tool_calls) note.textContent = `${m.tool_calls.length} 个 tool_calls`
+    else if (m.tool_call_id) note.textContent = `tool_call_id: ${String(m.tool_call_id).slice(0, 18)}`
+    const tok = el('span', 'raw-tok')
+    tok.textContent = fmtTok(m.tokens || 0) + ' tok'
+    head.append(idx, role, note, tok)
+
+    const bodyEl = el('div', 'raw-msg-body')
+    const pre = document.createElement('pre')
+    pre.textContent = m.content || '（空）'
+    bodyEl.append(pre)
+    if (m.tool_calls) {
+      const lab = el('div', 'raw-tc-label')
+      lab.textContent = 'tool_calls（真实发给 LLM 的 JSON）'
+      const tpre = document.createElement('pre')
+      tpre.textContent = JSON.stringify(m.tool_calls, null, 2)
+      bodyEl.append(lab, tpre)
+    }
+    head.onclick = () => card.classList.toggle('open')
+    card.append(head, bodyEl)
+    list.append(card)
+  }
+}
+
 /* ─────────────────────────────── 渲染：上下文页签
    这一页展示的是「下一轮真正要发给模型的东西」，不是内部记账。
    分段按 token 降序，每段可展开看正文。
@@ -395,6 +531,12 @@ function renderContext() {
   const s = active()
   const sum = $('ctxSummary')
   const list = $('ctxSections')
+  // 两种视图：原始态（真实 messages 顺序）与聚合态（按语义分段）。
+  const raw = s?.raw
+  if (S.ctxMode === 'raw') {
+    renderContextRaw(s, raw, sum, list)
+    return
+  }
   if (!s) {
     sum.innerHTML = ''
     list.innerHTML = '<div class="traj-empty">没有会话</div>'
@@ -412,6 +554,9 @@ function renderContext() {
     return
   }
 
+  for (const b of $('ctxModes').querySelectorAll('.ctx-mode')) {
+    b.classList.toggle('active', b.dataset.mode === 'aggregated')
+  }
   const parts = bd.parts || []
   const maxTok = Math.max(...parts.map((p) => p.tokens || 0), 1)
   const segs = parts.length
@@ -726,6 +871,11 @@ async function switchRepo(s, repoNames) {
     throw e
   }
 }
+function renderCotToggle() {
+  const b = $('cotToggle')
+  if (b) b.setAttribute('aria-pressed', S.cot ? 'true' : 'false')
+}
+
 function renderTop() {
   const s = active()
   const m = S.models.find((x) => x.id === (s?.model || S.defaultModel))
@@ -733,6 +883,11 @@ function renderTop() {
   $('modelBtnLabel').textContent = modelLabel
   $('modelBtn').title = `模型：${s?.model || S.defaultModel || '—'}（点击切换）`
   $('repoBtnLabel').textContent = s?.repo || repo
+  if (LOCKED_REPO) {
+    // 锁定态看起来就是个标签，不是可点的选择器
+    $('repoBtn').classList.add('locked')
+    $('repoBtn').title = `从项目面板进入，锁定在 ${repo}（回主页换项目）`
+  }
   $('ctxChip').textContent = fmtTok(s?.ctxTokens || 0) + ' tok'
   $('topTitle').textContent = s?.title || 'codeb 对话'
 
@@ -746,6 +901,7 @@ function renderTop() {
   $('composerHint').textContent = S.streaming
     ? '模型思考中…（可点停止）'
     : (s?.ready ? '就绪' : '待发送首条消息')
+  renderCotToggle()
 }
 
 /* ─────────────────────────────── 会话初始化（懒：首条消息时）
@@ -764,6 +920,8 @@ async function ensureReady(s) {
       route_specs: s.routeSpecs,
       custom: s.custom,
       model: s.model || S.defaultModel || '',
+      cot: s.cot,
+      llmHistory: s.llmHistory || [],
     }),
   })
   const data = await resp.json()
@@ -773,6 +931,7 @@ async function ensureReady(s) {
   s.ctxTokens = data.context_tokens || 0
   s.sections = data.sections || []
   s.breakdown = data.breakdown || null
+  s.raw = data.raw || []
   renderTop(); renderContext()
 }
 
@@ -814,7 +973,7 @@ async function send() {
   }
 
   const userMsg = { role: 'user', text }
-  const asMsg = { role: 'assistant', text: '', tools: [], pending: true }
+  const asMsg = { role: 'assistant', text: '', cot: '', tools: [], pending: true }
   s.messages.push(userMsg, asMsg)
   S.trajectory = []
   S.streaming = true
@@ -870,12 +1029,17 @@ async function send() {
         }
         repaintAssistant(asMsg)
         renderTrajectory()
+      } else if (ev.type === 'cot') {
+        asMsg.cot = (asMsg.cot || '') + (ev.text || '')
+        repaintAssistant(asMsg)
       } else if (ev.type === 'token') {
         asMsg.text += ev.text || ''
         repaintAssistant(asMsg)
       } else if (ev.type === 'done') {
         asMsg.text = ev.answer || asMsg.text
+        if (ev.cot) asMsg.cot = ev.cot
         asMsg.pending = false
+        if (ev.usage) asMsg.usage = ev.usage
         asMsg.stopped = !!ev.stopped
         asMsg.tools.forEach((t) => { if (t.state === 'running') t.state = 'done' })
         S.trajectory.forEach((t) => { if (t.state === 'running') t.state = 'done' })
@@ -900,6 +1064,9 @@ async function send() {
     // 这一轮结束后同步一次上下文构成：工具结果、折叠状态都变了，
     // 面板不刷新的话显示的还是上一轮的内容
     refreshContext()
+    // 每轮结束把 LLM 原始 history + 展示消息一起落盘。
+    // 失败不打扰用户（内存里还在，下一轮会再试）。
+    persistActiveSession(asMsg).catch(() => {})
   }
 }
 
@@ -949,6 +1116,7 @@ async function refreshContext() {
     const d = await r.json()
     if (d.ok && d.breakdown) {
       s.breakdown = d.breakdown
+      s.raw = d.raw || s.raw || []
       s.sections = d.sections || s.sections
       s.ctxTokens = d.total_tokens || s.ctxTokens
       renderContext(); renderTop()
@@ -956,13 +1124,166 @@ async function refreshContext() {
   } catch { /* 保底：保留旧数据 */ }
 }
 
+/* ─────────────────────────────── 分支
+   从某条消息复制出一个新会话前缀。LLM history 由服务端从分叉点那条
+   assistant 的 llm 里取（不是整条会话最后一条），这样分支才真的是分支。 */
+async function branchFrom(m) {
+  if (S.streaming) { toast('这一轮还没结束'); return }
+  const src = active()
+  if (!src) return
+  const seq = src.messages.indexOf(m)
+  if (seq < 0) return
+  const newId = 's-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+  try {
+    const r = await fetch('/api/chat/fork', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source_id: src.id, up_to_seq: seq, new_id: newId,
+        title: (src.title || '会话') + ' · 分支',
+      }),
+    })
+    const d = await r.json()
+    if (!d.ok) { toast('分支失败：' + (d.error || '')); return }
+    // 重新读回分支会话（服务端已建好库记录）
+    const rr = await fetch('/api/chat/session?id=' + encodeURIComponent(newId))
+    const dd = await rr.json()
+    if (!dd.ok) { toast('读取分支失败'); return }
+    const br = {
+      id: newId, title: dd.session.title, repo: dd.session.repo,
+      model: dd.session.model || S.defaultModel || '',
+      ctxTokens: 0, sections: [],
+      messages: (dd.messages || []).map((x) => ({
+        role: x.role, text: x.text || '', cot: x.cot || '',
+        tools: x.tools || [], error: x.error || '', stopped: !!x.stopped,
+        usage: x.usage || {}, llm: x.llm || [], pending: false,
+      })),
+      ready: false, treeDepth: dd.session.tree_depth || DEFAULT_TREE_DEPTH,
+      files: [], routeSpecs: [], custom: [], cot: !!dd.session.cot,
+      createdAt: dd.session.created_at,
+    }
+    const withLlm = [...br.messages].reverse().find((x) => x.llm && x.llm.length)
+    br.llmHistory = withLlm ? withLlm.llm : []
+    S.sessions.unshift(br)
+    switchSession(newId)
+    await ensureReady(br)
+    renderTop(); renderContext()
+    toast('已从这条消息分叉')
+  } catch (e) {
+    toast('分支失败：' + String(e?.message || e))
+  }
+}
+
+/* ─────────────────────────────── 会话持久化
+   每轮 done 后把 LLM history + 展示消息写进 sqlite；
+   刷新页面从 sqlite 恢复列表，点某个会话即重连并灌回 history。 */
+async function persistActiveSession(lastAsMsg) {
+  const s = active()
+  if (!s) return
+  // 拉一次权威 LLM history（含 tool_call_id），只有常驻进程里有
+  let llmHistory = s.llmHistory || []
+  try {
+    const r = await fetch('/api/chat/history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: s.id }),
+    })
+    const d = await r.json()
+    if (d.ok && Array.isArray(d.history)) {
+      llmHistory = d.history
+      s.llmHistory = d.history
+    }
+  } catch { /* 后端没起也无妨 */ }
+  const createdAt = s.createdAt || Date.now()
+  try {
+    await fetch('/api/chat/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: s.id, title: s.title, repo: s.repo, model: s.model,
+        cot: s.cot, tree_depth: s.treeDepth, created_at: createdAt,
+        messages: s.messages.map((m) => ({
+          role: m.role, text: m.text || '', cot: m.cot || '',
+          tools: m.tools || [], error: m.error || '', stopped: !!m.stopped,
+          usage: m.usage || {},
+          llm: m.role === 'assistant' && m === lastAsMsg ? llmHistory : [],
+        })),
+      }),
+    })
+  } catch { /* 落盘失败不影响使用 */ }
+}
+
+async function loadSavedSessions() {
+  try {
+    const r = await fetch('/api/chat/sessions')
+    const d = await r.json()
+    if (!d.ok || !Array.isArray(d.sessions) || !d.sessions.length) return false
+    // 逐条拉完整消息。会话不多（个人使用），一次性恢复即可，
+    // 省去「点开才加载」的复杂状态。
+    for (const saved of d.sessions) {
+      let messages = []
+      try {
+        const rr = await fetch('/api/chat/session?id=' + encodeURIComponent(saved.id))
+        const dd = await rr.json()
+        if (dd.ok) messages = (dd.messages || []).map((m) => ({
+          role: m.role, text: m.text || '', cot: m.cot || '',
+          tools: m.tools || [], error: m.error || '', stopped: !!m.stopped,
+          usage: m.usage || {}, llm: m.llm || [], pending: false,
+        }))
+      } catch { /* 单条失败不影响其它 */ }
+      const withLlm = [...messages].reverse().find((m) => m.llm && m.llm.length)
+      S.sessions.push({
+        id: saved.id,
+        title: saved.title || '新会话',
+        repo: saved.repo || repo,
+        model: saved.model || S.defaultModel || '',
+        ctxTokens: 0,
+        sections: [],
+        messages,
+        llmHistory: withLlm ? withLlm.llm : [],
+        ready: false,
+        treeDepth: saved.tree_depth || DEFAULT_TREE_DEPTH,
+        files: [], routeSpecs: [], custom: [],
+        cot: !!saved.cot,
+        createdAt: saved.created_at,
+      })
+    }
+    return true
+  } catch { return false }
+}
+
+async function openSavedSession(id) {
+  const s = S.sessions.find((x) => x.id === id)
+  if (!s) return
+  // 消息已在 boot 时全量恢复；这里只需切换并（首次）建上下文
+  switchSession(id)
+  try {
+    await ensureReady(s)
+    renderTop(); renderContext()
+  } catch (e) {
+    toast('连接会话失败：' + String(e?.message || e))
+  }
+}
+
 /* ─────────────────────────────── 启动 */
-function boot() {
-  const first = newSession()
+async function boot() {
+  // 先从 sqlite 恢复历史会话；有就默认打开最近的一条，没有再新建。
+  // 早先是先 newSession 再异步 load，结果新会话和历史会话同时在场、
+  // active 指向被异步覆盖，界面闪一下——现在串行，状态只有一个来源。
+  const hadSaved = await loadSavedSessions()
+  let first
+  if (hadSaved && S.sessions.length) {
+    first = S.sessions[0]
+    S.activeId = first.id
+    // 轨迹从消息里的 tools 重建
+    S.trajectory = []
+    for (const m of first.messages) {
+      for (const t of (m.tools || [])) S.trajectory.push({ ...t, msgRole: m.role })
+    }
+  } else {
+    first = newSession()
+  }
 
   // 开局就把上下文建起来：用户打开页面往往第一件事就是点「上下文」看装了什么。
-  // 早先要等发出第一条消息才初始化，于是面板是空的——「打开就看得见」
-  // 才是这个面板存在的意义。失败不打扰用户（首条消息还会再试一次）。
   ensureReady(first).then(() => {
     renderTop(); renderContext()
   }).catch(() => { /* 留给首条消息重试 */ })
@@ -974,10 +1295,32 @@ function boot() {
     $('input').focus()
   }
 
-  $('panelLink').onclick = () => { location.href = '/' }
+  // panelLink 现在是 <a href="/">，浏览器原生跳转即可，
+  // 不再绑 onclick——否则会和默认行为重复触发，也丢掉中键/右键复制地址。
 
   // 发送 / 停止 双态
   $('sendBtn').onclick = onSendClick
+
+  // 思考链开关：切换当前会话与默认值，下次新建会话继承
+  $('cotToggle').onclick = async () => {
+    S.cot = !S.cot
+    const s = active()
+    if (s) {
+      s.cot = S.cot
+      // 会话已初始化时，Python 进程里的 cot 开关还停在 init 那一刻。
+      // 必须推过去，否则翻了开关也照样不出 reasoning。失败只提示，
+      // 不回滚：本地状态已经改了，下次新建会话仍会继承。
+      if (s.ready) {
+        try {
+          await fetch('/api/chat/cot', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: s.id, cot: s.cot }),
+          })
+        } catch { toast('思考链开关未能同步到当前会话，下一条消息可能不生效') }
+      }
+    }
+    renderCotToggle()
+  }
 
   // 选择器
   $('modelBtn').onclick = (e) => {
@@ -987,6 +1330,9 @@ function boot() {
   }
   $('repoBtn').onclick = (e) => {
     e.stopPropagation()
+    // 从项目面板带 ?repo= 进来时锁死仓库：在 infohub 的对话里切到 codeb，
+    // 页签和上下文说的就是两个项目了，比不给切更容易出错。
+    if (LOCKED_REPO) { toast('当前对话锁定在 ' + repo + '，回主页换项目'); return }
     if ($('dropdown').style.display !== 'none') { closeDropdown(); return }
     showRepoPicker()
   }
@@ -1016,6 +1362,10 @@ function boot() {
 
   for (const b of $('topTabs').querySelectorAll('.tab')) {
     b.onclick = () => switchTab(b.dataset.tab)
+  }
+
+  for (const b of $('ctxModes').querySelectorAll('.ctx-mode')) {
+    b.onclick = () => { S.ctxMode = b.dataset.mode; renderContext() }
   }
 
   $('reloadCtxBtn').onclick = async () => {

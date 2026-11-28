@@ -19,6 +19,7 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import * as chatStore from './chat-store.mjs'
 
 /** 找一个可用的 Python。优先项目自带的 agvenv。 */
 function pythonCandidates(root) {
@@ -318,6 +319,11 @@ export function createChatApi({ ROOT, PY_SCRIPT }) {
       files: initOpts?.files || [],
       custom: initOpts?.custom || [],
       model: initOpts?.model || '',
+      cot: !!initOpts?.cot,
+      // 恢复历史：init 之后、首条 chat 之前由 chat_engine 灌回。
+      // llmHistory 是前端存的 LLM 原始消息（含 tool_call_id），
+      // 展示用的 messages 不能替代它——那是两回事。
+      history: initOpts?.llmHistory || [],
     })
     const line = await py.nextLine(120000)
     let obj
@@ -338,6 +344,43 @@ export function createChatApi({ ROOT, PY_SCRIPT }) {
   return async function handleChat(req, res, url) {
     const p = url.pathname
 
+    // ---------- 会话历史持久化 ----------
+    // 这几个路由不带 session_id 进程语义，纯读写 sqlite，放在 chatApi 里
+    // 只是为了共用 ROOT 与 sendJSON；不碰常驻 Python 进程。
+    if (p === '/api/chat/sessions' && req.method === 'GET') {
+      return sendJSON(res, 200, { ok: true, sessions: chatStore.listSessions(ROOT) }), true
+    }
+    if (p === '/api/chat/session' && req.method === 'GET') {
+      const id = url.searchParams.get('id') || ''
+      const d = chatStore.loadSession(ROOT, id)
+      return sendJSON(res, 200, d ? { ok: true, ...d } : { ok: false, error: '没有这个会话' }), true
+    }
+    if (p === '/api/chat/session' && req.method === 'POST') {
+      let body
+      try { body = await readBody(req) } catch (e) { return sendJSON(res, 400, { ok: false, error: e.message }), true }
+      const r = chatStore.saveSession(ROOT, body)
+      return sendJSON(res, r.ok ? 200 : 500, r), true
+    }
+    if (p === '/api/chat/session' && req.method === 'DELETE') {
+      let body = {}
+      try { body = await readBody(req) } catch { /* ignore */ }
+      const id = String(body.id || url.searchParams.get('id') || '')
+      const r = chatStore.deleteSession(ROOT, id)
+      return sendJSON(res, r.ok ? 200 : 500, r), true
+    }
+    if (p === '/api/chat/fork' && req.method === 'POST') {
+      let body
+      try { body = await readBody(req) } catch (e) { return sendJSON(res, 400, { ok: false, error: e.message }), true }
+      const srcId = String(body.source_id || '')
+      const upToSeq = Number(body.up_to_seq)
+      const newId = String(body.new_id || '')
+      if (!srcId || !newId || !Number.isInteger(upToSeq)) {
+        return sendJSON(res, 400, { ok: false, error: 'source_id / new_id / up_to_seq 必填' }), true
+      }
+      const r = chatStore.forkSession(ROOT, srcId, upToSeq, newId, body.title)
+      return sendJSON(res, r.ok ? 200 : 500, r), true
+    }
+
     // ---------- 模型清单 ----------
     if (p === '/api/chat/models') {
       return sendJSON(res, 200, { ok: true, ...loadModels(ROOT) }), true
@@ -346,6 +389,40 @@ export function createChatApi({ ROOT, PY_SCRIPT }) {
     // ---------- 仓库清单（自动更新）----------
     if (p === '/api/chat/repos') {
       return sendJSON(res, 200, { ok: true, repos: listRepos(ROOT) }), true
+    }
+
+    // ---------- 切换思考链（已初始化的会话） ----------
+    if (p === '/api/chat/cot' && req.method === 'POST') {
+      let body = {}
+      try { body = await readBody(req) } catch { /* 用默认 */ }
+      const sid = String(body.session_id || 'default')
+      const s = sessions.get(sid)
+      if (!s || !s.py.alive) return sendJSON(res, 200, { ok: true, cot: !!body.cot }), true
+      try {
+        s.py.send({ action: 'cot', cot: !!body.cot })
+        const line = await s.py.nextLine(15000)
+        const obj = JSON.parse(line)
+        return sendJSON(res, 200, { ok: true, ...obj }), true
+      } catch (e) {
+        return sendJSON(res, 500, { ok: false, error: String(e?.message || e) }), true
+      }
+    }
+
+    // ---------- 导出 LLM history（持久化用） ----------
+    if (p === '/api/chat/history' && req.method === 'POST') {
+      let body = {}
+      try { body = await readBody(req) } catch { /* 用默认 */ }
+      const sid = String(body.session_id || 'default')
+      const s = sessions.get(sid)
+      if (!s || !s.py.alive) return sendJSON(res, 200, { ok: true, history: [] }), true
+      try {
+        s.py.send({ action: 'history' })
+        const line = await s.py.nextLine(15000)
+        const obj = JSON.parse(line)
+        return sendJSON(res, 200, { ok: true, history: obj.history || [] }), true
+      } catch (e) {
+        return sendJSON(res, 500, { ok: false, error: String(e?.message || e) }), true
+      }
     }
 
     // ---------- 停止当前生成 ----------
@@ -394,6 +471,8 @@ export function createChatApi({ ROOT, PY_SCRIPT }) {
         const s = await ensureSession(sid, body)
         sendJSON(res, 200, {
           ok: true, session_id: sid, repo: s.repo, model: s.model,
+          cot: s.init?.cot ?? !!initOpts?.cot,
+          history_restored: s.init?.history_restored ?? 0,
           context_tokens: s.init?.context_tokens ?? 0,
           system_tokens: s.init?.system_tokens ?? 0,
           tools_tokens: s.init?.tools_tokens ?? 0,
@@ -401,6 +480,7 @@ export function createChatApi({ ROOT, PY_SCRIPT }) {
           // breakdown 要一起透传：前端上下文面板靠它展示「真正发出去的内容」。
           // 早先这里只挑了几个字段，面板就只能显示目录树，看不到系统提示词和工具定义。
           breakdown: s.init?.breakdown ?? null,
+          raw: s.init?.raw ?? [],
         })
       } catch (e) {
         sendJSON(res, 500, { ok: false, error: String(e?.message || e) })

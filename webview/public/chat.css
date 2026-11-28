@@ -240,9 +240,11 @@ body {
   font-size: 12px;
   cursor: pointer;
   border-radius: var(--radius-sm);
+  text-decoration: none;   /* 用 <a> 时去掉下划线，保持与 button 一致 */
   transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 .foot-btn:hover { background: var(--hover); color: var(--text-2); }
+.foot-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .repo-chip {
   align-self: flex-start;
   margin-left: 8px;
@@ -312,6 +314,79 @@ body {
 }
 .model-chip { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 
+/* 思考链开关（顶栏） */
+.cot-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-l1);
+  border-radius: 999px;
+  background: none;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+              border-color var(--dur) var(--ease);
+}
+.cot-toggle:hover { color: var(--text-2); background: var(--hover); }
+.cot-toggle[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: rgba(86,134,254,.45);
+  background: var(--accent-soft);
+}
+
+/* 消息里的思考链行（照 DSH ReasoningRow 的可折叠形态） */
+.cot-row {
+  margin: 0 0 10px;
+  border: 1px solid var(--border-l1);
+  border-radius: var(--radius-sm);
+  background: var(--bg-layer-1);
+  overflow: hidden;
+}
+.cot-row > summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.cot-row > summary::-webkit-details-marker { display: none; }
+.cot-row > summary:hover { color: var(--text-2); background: var(--hover); }
+.cot-row .cot-chevron {
+  transition: transform var(--dur) var(--ease);
+  flex: none;
+}
+.cot-row[open] .cot-chevron { transform: rotate(90deg); }
+.cot-row .cot-summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.cot-row .cot-running {
+  font-size: 10px;
+  color: var(--accent);
+  animation: cot-pulse 1.2s ease-in-out infinite;
+}
+@keyframes cot-pulse { 0%,100% { opacity: .4 } 50% { opacity: 1 } }
+.cot-body {
+  padding: 8px 12px 12px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-2);
+  border-top: 1px solid var(--border-l1);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 420px;
+  overflow: auto;
+}
+
 /* ── 顶栏选择器按钮（工作目录 / 模型）── */
 .picker-btn {
   display: inline-flex;
@@ -335,6 +410,10 @@ body {
 .picker-btn.open { background: var(--bg-layer-2); border-color: var(--border-l3); }
 .picker-btn > span { overflow: hidden; text-overflow: ellipsis; }
 .picker-btn svg { flex: none; opacity: 0.7; }
+/* 从项目面板进入时仓库锁死：看起来就是标签，不是选择器 */
+.picker-btn.locked { cursor: default; border-color: transparent; background: none; }
+.picker-btn.locked:hover { background: none; border-color: transparent; color: inherit; }
+.picker-btn.locked svg { display: none; }
 
 /* ── 下拉菜单 ── */
 .dropdown {
@@ -558,6 +637,39 @@ body {
 .msg-user .msg-text {
   color: var(--text);
   white-space: pre-wrap;
+}
+
+/* 消息操作行（复制 / 分支）：默认淡出，hover 或聚焦时显现，保持布局稳定 */
+.msg-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  opacity: .35;
+  transition: opacity var(--dur) var(--ease);
+}
+.msg:hover .msg-actions, .msg-actions:focus-within { opacity: 1; }
+.msg-act {
+  border: 1px solid transparent;
+  background: none;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 3px 7px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.msg-act:hover { color: var(--text); border-color: var(--border-l1); background: var(--hover); }
+
+/* 每轮 token 用量 */
+.usage-bar { margin-top: 8px; }
+.usage-pill {
+  display: inline-block;
+  font-size: 10px;
+  font-family: var(--mono);
+  color: var(--muted);
+  border: 1px solid var(--border-l1);
+  padding: 2px 7px;
+  border-radius: 999px;
 }
 
 /* markdown 精简渲染 */
@@ -847,6 +959,99 @@ body {
 }
 
 /* ══════════════════════════════════════════ 上下文页签 */
+/* 上下文两种视图切换：聚合态 / 原始态 */
+.ctx-modes {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.ctx-mode {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 9px 12px;
+  border: 1px solid var(--border-l1);
+  border-radius: var(--radius-sm);
+  background: var(--bg-layer-1);
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.ctx-mode:hover { background: var(--hover); }
+.ctx-mode.active {
+  color: var(--accent);
+  border-color: rgba(86,134,254,.45);
+  background: var(--accent-soft);
+}
+.ctx-mode .mode-hint {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+/* 原始态：逐条 messages，按真实顺序 */
+.raw-msg {
+  border: 1px solid var(--border-l1);
+  border-radius: var(--radius-sm);
+  margin-bottom: 8px;
+  background: var(--bg-layer-1);
+  overflow: hidden;
+}
+.raw-msg-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.raw-msg-head:hover { background: var(--hover); }
+.raw-idx {
+  font-family: var(--mono);
+  color: var(--muted);
+  font-size: 11px;
+  min-width: 26px;
+}
+.raw-role {
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+}
+.raw-role.system { background: var(--bg-layer-3); color: var(--text-2); }
+.raw-role.user { background: var(--accent-soft); color: var(--accent); }
+.raw-role.assistant { background: rgba(52,199,123,.14); color: #34c77b; }
+.raw-role.tool { background: rgba(255,179,64,.14); color: #ffb340; }
+.raw-tok { margin-left: auto; font-family: var(--mono); color: var(--muted); font-size: 11px; }
+.raw-note { font-size: 10px; color: var(--muted); }
+.raw-msg-body {
+  display: none;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border-l1);
+}
+.raw-msg.open .raw-msg-body { display: block; }
+.raw-msg pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-2);
+  max-height: 500px;
+  overflow: auto;
+}
+.raw-tc-label {
+  font-size: 10px;
+  color: var(--muted);
+  margin: 8px 0 4px;
+}
+
 .ctx-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));

@@ -9,12 +9,20 @@
 <body>
 <header>
   <div class="brand">
+    <a class="crumb-back" href="/" title="回到项目列表">← 项目</a>
     <span class="dot"></span>
-    <h1>codeb 项目情况面板</h1>
-    <span class="workspace" id="workspace">—</span>
+    <h1 id="panelTitle">项目面板</h1>
   </div>
   <div class="header-actions">
     <span class="source-badges" id="sourceBadges"></span>
+    <!-- 用 <a> 而不是 button：能中键/新标签页打开，地址可复制分享 -->
+    <a class="nav-link" href="/chat" id="chatEntry" title="进入 codeb 对话">
+      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+        <path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z" fill="none"
+              stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+      </svg>
+      对话
+    </a>
     <button id="refreshBtn" title="重新拉取数据">刷新</button>
   </div>
 </header>
@@ -52,7 +60,7 @@
 
   <!-- 项目目录表：结构由 scan 自动生成，介绍由 LLM/agent 填写；这里只读 -->
   <section class="card projtree-card">
-    <h2>项目目录表 <span class="hint">结构自动生成 · 介绍由 LLM/agent 填写，只读</span></h2>
+    <h2>项目目录表 <span class="hint" id="ptHint">结构自动生成 · 介绍由 LLM 填写</span></h2>
     <div class="pt-toolbar">
       <div class="pt-repos" id="ptRepos"></div>
       <div class="pt-filters" id="ptFilters">
@@ -62,7 +70,17 @@
         <button data-filter="noted">已写</button>
       </div>
       <input id="ptSearch" class="pt-search" type="search" placeholder="按路径 / 介绍筛选…">
+      <!-- 两个维护动作：结构靠扫盘（快），介绍靠 LLM（慢） -->
+      <div class="pt-actions">
+        <button id="ptScanBtn" class="pt-act" title="重新扫描磁盘上的文件结构，不调用 LLM">
+          更新结构
+        </button>
+        <button id="ptFillBtn" class="pt-act" title="用 LLM 给未写的文件补介绍，耗时较长">
+          更新说明
+        </button>
+      </div>
     </div>
+    <div class="pt-job" id="ptJob" style="display:none"></div>
     <div class="pt-kpis" id="ptKpis"></div>
     <div class="pt-tree" id="ptTree"><div class="loading">加载中…</div></div>
   </section>

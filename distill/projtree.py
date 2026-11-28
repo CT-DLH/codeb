@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -39,6 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import kb  # noqa: E402  复用选型口径
+from kb import repo_root  # noqa: E402  知识库的 repo/ 目录
 
 # 入表的扩展名。含 .md：README.md / DESIGN.md / webview/README.md 是项目文档，
 # 属于源码目录的一部分，不能一刀切掉。
@@ -102,6 +104,22 @@ CREATE TABLE IF NOT EXISTS scan_log (
   elapsed_ms INTEGER,
   at        TEXT NOT NULL,
   PRIMARY KEY (repo, scan_id)
+);
+
+-- 项目注册表：哪个项目、源码在哪、从哪来。
+--
+-- 为什么必须是表而不是继续靠「frontmatter root: + 同名兄弟目录」两条约定：
+-- 导入一个 D:\\work\\project\\foo 时两条都不成立（foo 不是 codeb 的兄弟目录，
+-- 也没人给它写 frontmatter），kb.repo_roots() 就找不到源码根，
+-- chat 装订目录树会直接空掉——界面看着像成功，上下文却是空的。
+-- 所以这张表成为「认仓库」的第一真值，旧的两条规则退为兜底。
+CREATE TABLE IF NOT EXISTS projects (
+  name       TEXT PRIMARY KEY,          -- 与 repo/<name>/ 同名，英文小写
+  disk_path  TEXT NOT NULL,             -- 源码磁盘根
+  display    TEXT,                      -- 显示名；空则用 name
+  source     TEXT NOT NULL,             -- discovered 自动发现 / imported 用户导入
+  note       TEXT,
+  created_at TEXT NOT NULL
 );
 """
 
@@ -306,6 +324,191 @@ def cmd_scan(root: Path, repo: str, use_git: bool, keep_all: bool,
            where n.repo=? and f.path is null""", (repo,)).fetchone()[0]
     print(f"  介绍：过期 {stale}，孤儿 {missing}")
     return 0
+
+
+def cmd_projects(root: Path, args) -> int:
+    """projects list / add <path> / rm <name>。
+
+    注意 --root 是**知识库根**（有 .codeb 的那个），而 add 的源码路径
+    由位置参数给——两者是不同概念，别混用。
+    """
+    op = args.op or "list"
+
+    if op == "list":
+        rows = list_projects(root)
+        if not rows:
+            print("还没有项目。加一个：projtree projects add <源码路径>")
+            return 0
+        print(f"{'项目':<16}{'文件':>7}  {'来源':<11}{'状态':<8}磁盘路径")
+        conn = open_db(root)
+        try:
+            for p in rows:
+                n = conn.execute(
+                    "select count(*) from project_files where repo=? and is_dir=0",
+                    (p["name"],)).fetchone()[0]
+                state = ("缺失" if not p["exists"] else
+                         ("已登记" if p["registered"] else "未登记"))
+                print(f"{p['name']:<16}{n:>7}  {p['source']:<11}{state:<8}"
+                      f"{p['disk_path'] or '—'}")
+        finally:
+            conn.close()
+        return 0
+
+    if op == "add":
+        src = args.target or ""
+        if not src:
+            print("用法：projtree projects add <源码路径> [--name x]", file=sys.stderr)
+            return 2
+        disk = Path(src).expanduser()
+        if not disk.is_dir():
+            print(f"路径不存在或不是目录：{disk}", file=sys.stderr)
+            return 2
+        name = (args.name or disk.resolve().name).strip().lower()
+        try:
+            p = register_project(root, name, str(disk.resolve()),
+                                 display=args.display, source="imported",
+                                 note=args.note)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+        print(f"已登记项目 {p['name']} → {p['disk_path']}")
+        # 顺手建 repo/<name>/knowledge/ 骨架，否则知识库里查不到这个项目
+        d = repo_root(root) / name / "knowledge"
+        d.mkdir(parents=True, exist_ok=True)
+        print(f"知识页骨架：{d.relative_to(root)}")
+        print(f"接着可跑：python -m distill.projtree --root {p['disk_path']} scan")
+        return 0
+
+    if op == "rm":
+        name = (args.target or args.name or "").strip()
+        if not name:
+            print("用法：projtree projects rm <项目名>", file=sys.stderr)
+            return 2
+        if unregister_project(root, name):
+            print(f"已注销 {name} 的登记（repo/ 与磁盘文件都保留）")
+            return 0
+        print(f"{name} 不在注册表里", file=sys.stderr)
+        return 1
+
+    return 2
+
+
+# --------------------------------------------------------------- 项目注册表
+
+def list_projects(root: Path) -> list[dict]:
+    """列出所有项目：注册表里的 + 磁盘上发现但没登记的。
+
+    两路合并，因为一个知识库的历史状态可能只有后者：
+    老库（没跑过 projects add）四个项目全靠 frontmatter/兄弟目录约定，
+    主页要把它们也显示出来，否则升级后主页是空的。
+
+    返回顺序：先 registered，再 discovered，各自按名字排序。
+    """
+    conn = open_db(root)
+    try:
+        rows = conn.execute(
+            "select name,disk_path,display,source,note,created_at "
+            "from projects order by name").fetchall()
+    finally:
+        conn.close()
+
+    out: dict[str, dict] = {}
+    for name, disk, display, source, note, created in rows:
+        out[name] = {
+            "name": name, "disk_path": str(disk), "display": display or name,
+            "source": source or "imported", "note": note or "",
+            "created_at": created or "", "registered": True,
+            "exists": Path(disk).is_dir(),
+        }
+
+    # 补充：知识库里已有目录、但没登记的（老库升级路径）
+    for name in _known_repo_names(root):
+        if name in out or name.startswith("_"):
+            continue                      # _shared 这类不是可进入的项目
+        disk = _guess_disk_root(root, name)
+        out[name] = {
+            "name": name, "disk_path": str(disk) if disk else "",
+            "display": name, "source": "discovered", "note": "",
+            "created_at": "", "registered": False,
+            "exists": bool(disk and Path(disk).is_dir()),
+        }
+
+    def sortkey(p: dict):
+        return (0 if p["registered"] else 1, p["name"])
+
+    return sorted(out.values(), key=sortkey)
+
+
+def _known_repo_names(root: Path) -> list[str]:
+    """repo/ 下有一级子目录的仓库名（即知识库里真实存在的项目）。"""
+    d = repo_root(root)
+    try:
+        return sorted(e.name for e in d.iterdir() if e.is_dir())
+    except OSError:
+        return []
+
+
+def _guess_disk_root(root: Path, name: str) -> Path | None:
+    """猜某个仓库的源码根：frontmatter root: → 兄弟目录。猜不到返回 None。
+
+    与 kb.repo_roots 的判定顺序一致，只是限定在单个仓库上。
+    """
+    d = repo_root(root) / name
+    try:
+        for pg in sorted(d.rglob("*.md")):
+            text = pg.read_text(encoding="utf-8", errors="replace")
+            head = "\n".join(text.splitlines()[:24])
+            m = re.search(r"^root:\s*(.+)$", head, re.M)
+            if m:
+                p = Path(m.group(1).strip().strip("\"'"))
+                if p.is_dir():
+                    return p
+    except OSError:
+        pass
+    sib = Path(root).resolve().parent / name
+    return sib if sib.is_dir() else None
+
+
+def register_project(root: Path, name: str, disk_path: str,
+                     display: str = "", source: str = "imported",
+                     note: str = "") -> dict:
+    """登记/更新一个项目。只写注册表，不碰 repo/ 与磁盘。"""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("项目名不能为空")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", name):
+        raise ValueError(f"项目名必须是英文小写字母/数字/._-，得到：{name!r}")
+    disk = Path(disk_path).expanduser()
+    if not disk.is_absolute():
+        disk = disk.resolve()
+    t = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    conn = open_db(root)
+    try:
+        conn.execute(
+            "INSERT INTO projects (name,disk_path,display,source,note,created_at) "
+            "VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET disk_path=excluded.disk_path, "
+            "display=excluded.display, source=excluded.source, note=excluded.note",
+            (name, str(disk), display or name, source, note, t))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"name": name, "disk_path": str(disk), "display": display or name,
+            "source": source, "note": note, "exists": disk.is_dir()}
+
+
+def unregister_project(root: Path, name: str) -> bool:
+    """注销登记。**不删 repo/、不删磁盘、不删目录表数据**。
+
+    删知识页是不可逆操作，必须走人工；这里只负责「主页不再显示它」。
+    """
+    conn = open_db(root)
+    try:
+        cur = conn.execute("DELETE FROM projects WHERE name=?", (name,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------- 查询
@@ -786,6 +989,15 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("stats", help="统计")
     sub.add_parser("orphans", help="列出孤儿介绍")
+
+    # 项目注册表：主页与 repo_roots 的数据源
+    pj = sub.add_parser("projects", help="项目注册表（list / add / rm）")
+    pj.add_argument("op", choices=["list", "add", "rm"], nargs="?", default="list")
+    pj.add_argument("target", nargs="?", default="",
+                    help="add 时是源码路径；rm 时是项目名")
+    pj.add_argument("--name", default="", help="项目名（默认取目录名）")
+    pj.add_argument("--display", default="", help="显示名")
+    pj.add_argument("--note", default="", help="备注")
     fl = sub.add_parser("fill", help="用 LLM 补介绍")
     fl.add_argument("--mode", default="openai", choices=["openai", "cmd", "none"])
     fl.add_argument("--only", default="missing",
@@ -823,6 +1035,8 @@ def main(argv: list[str] | None = None) -> int:
                         args.force, args.verbose, args.model)
     if args.cmd == "clean":
         return cmd_clean(root, repo, args.prefix, args.yes)
+    if args.cmd == "projects":
+        return cmd_projects(root, args)
     return cmd_forget(root, repo, args.path)
 
 

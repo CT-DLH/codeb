@@ -516,14 +516,74 @@ export function detectRoot(start) {
   return path.resolve(start || process.cwd())
 }
 
-/** Build the full payload consumed by the webview. */
-export function buildPayload(root, { lazyTree = false } = {}) {
+/**
+ * 按项目过滤 payload 的各个区块。
+ *
+ * 为什么在 data.mjs 而不是前端做：前端做过滤意味着要把全量数据（4 个项目
+ * 的页表 + covers + 时间线）都传到浏览器，再丢掉 3/4——infohub 一个项目就有
+ * 2.9 万节点。过滤要在源头。
+ *
+ * 不同区块的过滤键不一样，这是历史造成的，不能统一：
+ *   tree       按 node.name 等于项目名
+ *   covers     按路径首段（'codeb\\commands.md' → codeb）
+ *   timeline   全局：agent 日志里没有可靠的 repo 字段，硬筛会漏事件
+ */
+function filterPayload(payload, project) {
+  const want = String(project || '').trim()
+  if (!want) return payload
+
+  const tree = payload.tree ? {
+    ...payload.tree,
+    projects: (payload.tree.projects || []).filter((n) => n.name === want),
+  } : payload.tree
+
+  const covers = filterCovers(payload.covers, want)
+  const index = filterIndex(payload.index, want)
+
+  return { ...payload, project: want, tree, covers, index }
+}
+
+/** covers 的条目形如 `codeb\commands.md` 或 `codeb/commands.md`，取首段比。 */
+function filterCovers(covers, project) {
+  if (!covers) return covers
+  const inRepo = (s) => {
+    const seg = String(s || '').replace(/\\/g, '/').split('/')[0]
+    return seg === project
+  }
+  const sub = (sec) => (sec && Array.isArray(sec.items)
+    ? { ...sec, items: sec.items.filter(inRepo) }
+    : sec)
+  return {
+    ...covers,
+    stale: sub(covers.stale),
+    conflict: sub(covers.conflict),
+    uncovered: sub(covers.uncovered),
+  }
+}
+
+/** 索引区块里 blockFiles 带 repo 列，直接筛；计数也要跟着改。 */
+function filterIndex(index, project) {
+  if (!index || !Array.isArray(index.blockFiles)) return index
+  const files = index.blockFiles.filter((f) => f.repo === project)
+  return {
+    ...index,
+    blockFiles: files,
+    blocksCount: files.reduce((s, f) => s + f.count, 0),
+    project,
+  }
+}
+
+/** Build the full payload consumed by the webview.
+ *
+ * `project` 非空时只保留该项目的区块（主页→项目面板的隔离）。
+ */
+export function buildPayload(root, { lazyTree = false, project = '' } = {}) {
   const tree = buildTree(root, { lazy: lazyTree })
   const covers = readCovers(root)
   const verification = readVerification(root)
   const timeline = readTimeline(root)
   const treeLive = fs.existsSync(path.join(root, 'repo/00-projects.md'))
-  return {
+  const payload = {
     workspace: root,
     generatedAt: new Date().toISOString(),
     source: {
@@ -538,4 +598,5 @@ export function buildPayload(root, { lazyTree = false } = {}) {
     timeline: timeline.events,
     logFiles: timeline.files,
   }
+  return filterPayload(payload, project)
 }

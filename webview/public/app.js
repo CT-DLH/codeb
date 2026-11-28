@@ -12,9 +12,24 @@ const fmtTime = (ts) => {
 let PAYLOAD = null
 let coversTab = 'stale'
 
+/**
+ * 当前项目名，来自 /p/<name>。
+ *
+ * 有项目名时必须传 ?project= 给 /api/data：过滤要在服务端做，
+ * 否则 4 个项目的页表全传到浏览器再丢掉 3/4——infohub 一个就 2.9 万节点。
+ */
+const PROJECT = (() => {
+  const m = location.pathname.match(/^\/p\/([^/]+)\/?$/)
+  return m ? decodeURIComponent(m[1]) : ''
+})()
+const withProject = (u) => PROJECT
+  ? u + (u.includes('?') ? '&' : '?') + 'project=' + encodeURIComponent(PROJECT)
+  : u
+
 // 项目目录表状态。infohub 有 2.9 万个节点，不能一次全渲染成 DOM，
 // 所以用「内存里放全量、展开时才渲染直接子节点」的懒渲染。
-const PT = { data: null, repo: null, filter: 'all', search: '', children: null, byPath: null }
+const PT = { data: null, repo: null, filter: 'all', search: '', children: null, byPath: null,
+  jobRunning: false }
 
 function toast(msg) {
   const t = $('toast')
@@ -24,14 +39,21 @@ function toast(msg) {
   toast._t = setTimeout(() => t.classList.remove('show'), 2200)
 }
 
-async function fetchJSON(url) {
-  const r = await fetch(url, { cache: 'no-store' })
+async function fetchJSON(url, opts) {
+  // opts 必须透传给 fetch：早先这里只收 url，于是 POST 的 method/body 被静默丢掉，
+  // 变成了 GET —— 后端只挂 POST，前端拿到一个 404「not found」，
+  // 看起来像路由没注册，实际是请求方法错了。
+  const r = await fetch(url, { cache: 'no-store', ...opts })
   if (!r.ok) throw new Error(`${r.status} ${await r.text()}`)
   return r.json()
 }
 
 function renderHeader(p) {
-  $('workspace').textContent = p.workspace
+  if (PROJECT) {
+    const t = $('panelTitle')
+    if (t) t.textContent = (p.tree?.projects?.[0]?.name) || PROJECT
+    document.title = (PROJECT) + ' · codeb'
+  }
   const badges = Object.entries(p.source || {}).map(([k, v]) =>
     `<span class="badge ${v === 'live' ? 'live' : 'snapshot'}" title="${k}">${k}: ${v}</span>`).join('')
   $('sourceBadges').innerHTML = badges
@@ -431,26 +453,40 @@ function ptRenderChildren(parent, box, depth) {
 
 function renderProjTreeRoot() {
   if (!PT.data || !PT.data.live) {
-    $('ptTree').innerHTML = '<div class="pt-empty">目录表未生成：先跑 python -m distill.projtree scan</div>'
+    // 目录表还没生成：这时「更新结构」是唯一能救场的动作，要可点；
+    // 「更新说明」需要已有结构才能补介绍，禁用。
+    $('ptTree').innerHTML = '<div class="pt-empty">目录表未生成，点「更新结构」扫描磁盘</div>'
     $('ptRepos').innerHTML = ''
     $('ptKpis').innerHTML = ''
+    if (!PT.jobRunning) {
+      $('ptScanBtn').disabled = !PT.repo
+      $('ptFillBtn').disabled = true
+    }
     return
   }
   const t = PT.data
-  if (!PT.repo || !t.repos.some((r) => r.repo === PT.repo)) {
+  // 项目面板只显示当前项目：PT.repo 锁定，不再给切换按钮
+  //（主页才是选项目的地方，面板里再放一个切换器会让「我在看哪个项目」变模糊）
+  if (PROJECT) {
+    PT.repo = PROJECT
+  } else if (!PT.repo || !t.repos.some((r) => r.repo === PT.repo)) {
     PT.repo = t.repo || (t.repos[0] && t.repos[0].repo)
   }
-  $('ptRepos').innerHTML = t.repos.map((r) =>
-    `<button data-repo="${esc(r.repo)}" class="${r.repo === PT.repo ? 'active' : ''}">${esc(r.repo)} (${r.count})</button>`).join('')
-  $('ptRepos').querySelectorAll('button').forEach((b) =>
-    b.addEventListener('click', () => {
-      PT.repo = b.dataset.repo
-      fetchJSON('/api/projtree?repo=' + encodeURIComponent(PT.repo)).then((d) => {
-        PT.data = d
-        ptBuildIndex(d)
-        renderProjTreeRoot()   // KPI（含 token）与仓库按钮也要跟着刷新
-      })
-    }))
+  if (PROJECT) {
+    $('ptRepos').innerHTML = ''
+  } else {
+    $('ptRepos').innerHTML = t.repos.map((r) =>
+      `<button data-repo="${esc(r.repo)}" class="${r.repo === PT.repo ? 'active' : ''}">${esc(r.repo)} (${r.count})</button>`).join('')
+    $('ptRepos').querySelectorAll('button').forEach((b) =>
+      b.addEventListener('click', () => {
+        PT.repo = b.dataset.repo
+        fetchJSON('/api/projtree?repo=' + encodeURIComponent(PT.repo)).then((d) => {
+          PT.data = d
+          ptBuildIndex(d)
+          renderProjTreeRoot()   // KPI（含 token）与仓库按钮也要跟着刷新
+        })
+      }))
+  }
 
   const s = t.stats || {}
   const tk = t.tokens || {}
@@ -513,7 +549,110 @@ function bindProjTree() {
     PT.search = e.target.value.trim()
     renderProjTree()
   })
+  $('ptScanBtn').addEventListener('click', () => runPtJob('structure'))
+  $('ptFillBtn').addEventListener('click', () => runPtJob('notes'))
 }
+
+/**
+ * 触发目录表维护任务，然后轮询进度。
+ *
+ * 两个动作都必须异步：scan 秒级以上，fill 逐批调 LLM 可能几分钟。
+ * 前端拿到 started 后开始轮询 /api/projtree，任务状态由服务端算好一起返回。
+ */
+async function runPtJob(kind) {
+  if (!PT.repo) { toast('先选一个项目'); return }
+  if (PT.jobRunning) { toast('还有任务在跑'); return }
+
+  const btnScan = $('ptScanBtn')
+  const btnFill = $('ptFillBtn')
+  btnScan.disabled = btnFill.disabled = true
+  PT.jobRunning = true
+  showJob({
+    running: true, kind,
+    text: kind === 'structure' ? '正在扫描磁盘结构…' : '正在用 LLM 补写介绍…',
+  })
+
+  try {
+    await fetchJSON('/api/projtree/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo: PT.repo, kind }),
+    })
+    pollPtJob(kind)
+  } catch (e) {
+    PT.jobRunning = false
+    btnScan.disabled = btnFill.disabled = false
+    showJob({ running: false, ok: false, text: String(e.message || e) })
+    toast('启动失败：' + e.message)
+  }
+}
+
+let ptPollTimer = null
+
+/** 轮询任务状态：每 1.5 秒拉一次，跑完刷新目录表并停表。 */
+function pollPtJob(kind) {
+  if (ptPollTimer) clearInterval(ptPollTimer)
+  ptPollTimer = setInterval(async () => {
+    try {
+      const [proj, tree] = await Promise.all([
+        fetchJSON('/api/projects'),
+        fetchJSON('/api/projtree?repo=' + encodeURIComponent(PT.repo)),
+      ])
+      const p = (proj.projects || []).find((x) => x.name === PT.repo)
+      const job = (p && p.job) || { running: false }
+
+      if (job.running) {
+        showJob({
+          running: true, kind,
+          text: kind === 'structure'
+            ? `正在扫描磁盘结构…${job.elapsed || 0}s`
+            : `正在用 LLM 补写介绍…${job.elapsed || 0}s`
+                 + (job.progress ? ` (${job.progress}%)` : ''),
+        })
+        return
+      }
+
+      // 跑完了
+      clearInterval(ptPollTimer)
+      ptPollTimer = null
+      PT.jobRunning = false
+      $('ptScanBtn').disabled = $('ptFillBtn').disabled = false
+
+      // 目录表可能已经变了（结构或介绍），拉最新的重画
+      if (tree && tree.live) {
+        PT.data = tree
+        ptBuildIndex(tree)
+        renderProjTreeRoot()
+      }
+      const ok = job.ok !== false
+      showJob({
+        running: false, ok, kind,
+        text: ok
+          ? (kind === 'structure' ? '结构已更新' : '说明已更新')
+          : '任务失败',
+        tail: job.tail || '',
+      })
+      toast(ok ? (kind === 'structure' ? '结构已更新' : '说明已更新') : '任务失败，见下方输出')
+    } catch { /* 轮询出错就等下一轮；服务重启等情况会自然停 */ }
+  }, 1500)
+}
+
+/** 在目录表工具栏下方显示任务状态条。 */
+function showJob(s) {
+  const box = $('ptJob')
+  if (!s) { box.style.display = 'none'; return }
+  box.style.display = ''
+  box.className = 'pt-job' + (s.running ? ' running'
+    : (s.ok === false ? ' err' : ' ok'))
+
+  const dot = s.running ? '<span class="pt-job-dot"></span>' : ''
+  let html = `${dot}<span class="pt-job-text">${esc(s.text || '')}</span>`
+  if (s.tail) {
+    html += `<pre class="pt-job-tail">${esc(s.tail)}</pre>`
+  }
+  box.innerHTML = html
+}
+
 
 function render(p) {
   PAYLOAD = p
@@ -528,7 +667,7 @@ function render(p) {
 
 async function load() {
   try {
-    const p = await fetchJSON('/api/data')
+    const p = await fetchJSON(withProject('/api/data'))
     render(p)
     toast('已刷新 ' + new Date().toLocaleTimeString('zh-CN'))
     // covers 自检要跑 Python（秒级），不阻塞首屏——先把页面画出来，再补。
@@ -545,9 +684,9 @@ async function load() {
       $('coversList').innerHTML = '<div class="empty">covers 自检失败</div>'
     })
     // 目录表按需单独取：它可能很大（infohub 2.9 万节点），不阻塞首屏。
-    fetchJSON('/api/projtree').then((d) => {
+    fetchJSON('/api/projtree' + (PROJECT ? '?repo=' + encodeURIComponent(PROJECT) : '')).then((d) => {
       PT.data = d
-      PT.repo = d.repo || PT.repo
+      PT.repo = PROJECT || d.repo || PT.repo
       ptBuildIndex(d)
       renderProjTreeRoot()
     }).catch((e) => {
@@ -560,6 +699,11 @@ async function load() {
 }
 
 $('refreshBtn').addEventListener('click', load)
+// 对话入口带上当前项目，否则从 infohub 面板点进去问的是 codeb
+if (PROJECT) {
+  const a = $('chatEntry')
+  if (a) a.href = '/chat?repo=' + encodeURIComponent(PROJECT)
+}
 bindDetailActions()
 bindProjTree()
 load()

@@ -589,7 +589,7 @@ FOLD_ROUNDS = {
 # ============================================================ LLM 调用
 def call_llm(env: dict, system: str, messages: list, tools: list,
              max_tokens: int = 4096, stop_flag=None,
-             on_token=None) -> tuple[dict, dict]:
+             on_token=None, on_cot=None, cot: bool = False) -> tuple[dict, dict]:
     """调 LLM。返回 (message, usage)。
 
     用 SSE 流式读，不是一次性等全部——两个原因：
@@ -623,10 +623,11 @@ def call_llm(env: dict, system: str, messages: list, tools: list,
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-    # NVIDIA 的推理型模型必须关 thinking，否则 content 为空
-    # （实测 tool_choice="required" 在该端点会烧光 max_tokens 返回空，不可用）
+    # NVIDIA 端点默认关 thinking：早期实测 tool_choice="required" 时开着会烧光
+    # max_tokens 返回空 content。现在改为**按会话开关**：cot=False 保持原行为，
+    # cot=True 才打开，让模型输出 reasoning_content。前端有独立的「思考」开关。
     if "nvidia.com" in base:
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload["chat_template_kwargs"] = {"enable_thinking": bool(cot)}
 
     req = urllib.request.Request(
         f"{base}/chat/completions",
@@ -636,6 +637,7 @@ def call_llm(env: dict, system: str, messages: list, tools: list,
                  "Authorization": f"Bearer {key}"})
 
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []   # CoT：reasoning_content（DeepSeek）/ reasoning（其他）
     # index -> {"id","name","arguments"}
     calls: dict[int, dict] = {}
     usage: dict = {}
@@ -670,6 +672,14 @@ def call_llm(env: dict, system: str, messages: list, tools: list,
                         content_parts.append(piece)
                         if on_token:
                             on_token(piece)
+                    # CoT 增量：不同端点字段名不同，两个都认。
+                    reason = delta.get("reasoning_content")
+                    if reason is None:
+                        reason = delta.get("reasoning")
+                    if reason:
+                        reasoning_parts.append(reason)
+                        if on_cot:
+                            on_cot(reason)
                     for tc in delta.get("tool_calls") or []:
                         idx = tc.get("index", 0)
                         slot = calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
@@ -687,6 +697,8 @@ def call_llm(env: dict, system: str, messages: list, tools: list,
         raise RuntimeError(f"连不上 LLM 端点：{e.reason}") from None
 
     msg: dict = {"role": "assistant", "content": "".join(content_parts)}
+    if reasoning_parts:
+        msg["reasoning"] = "".join(reasoning_parts)
     if calls:
         msg["tool_calls"] = [
             {"id": calls[i]["id"] or f"call_{i}", "type": "function",
@@ -707,9 +719,10 @@ class ChatSession:
                  route_specs: list[dict] | None = None,
                  files: list[dict] | None = None,
                  custom: list[dict] | None = None,
-                 model: str = ""):
+                 model: str = "", cot: bool = False):
         self.root = root
         self.repo = repo
+        self.cot = bool(cot)   # 是否让模型输出 reasoning（思考链）
         self.env = load_env()
         if model:
             self.env["ZHIHU_LLM_MODEL"] = model
@@ -760,6 +773,19 @@ class ChatSession:
         """输出一行 NDJSON 给父进程。"""
         sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
         sys.stdout.flush()
+
+    def emit_done(self, answer: str, usage: dict, stopped: bool,
+                  cot_parts: list[str]) -> None:
+        """统一的 done 出口：把整轮累积的 CoT 一次性带上。
+
+        增量 `cot` 事件已边生成边推给前端，这里再带全量是为了让前端在
+        done 时定稿（流式可能被截断），也是会话持久化时唯一可靠的 CoT 来源。
+        """
+        d = {"type": "done", "answer": answer, "usage": usage,
+             "stopped": stopped, "context_tokens": self.context_tokens()}
+        if cot_parts:
+            d["cot"] = "".join(cot_parts)
+        self.emit(d)
 
     # ---------------- 账本 ----------------
     def _add_block(self, tool: str, text: str, hist_idx: int) -> dict:
@@ -847,6 +873,18 @@ class ChatSession:
 
         model = self.env.get("ZHIHU_LLM_MODEL") or DEFAULT_MODEL
         last_usage: dict = {}
+        # 一轮对话可能跨多个工具轮次，每个 assistant 响应都可能带一段 reasoning。
+        # 累积起来随 done 一次性交给前端，这样前端刷新/恢复时也能拿到完整 CoT。
+        cot_parts: list[str] = []
+
+        def on_cot(t: str):
+            # 即使端点没按 enable_thinking 关掉 reasoning（非 NVIDIA 端点
+            # 拿不到那个参数），前端没开思考链时也不该收到 cot 事件。
+            # 开关是唯一真值，不依赖端点配合。
+            if not self.cot:
+                return
+            cot_parts.append(t)
+            self.emit({"type": "cot", "text": t})
 
         # 轮次上限：正常问题 1-3 轮就够，实测最坏的一次模型连跑 25 轮工具
         # 才开口说话（那是它把「逐个文件统计」当成了任务）。定 12 轮：
@@ -874,8 +912,9 @@ class ChatSession:
                                         "信息确实不够的部分，明确说缺什么。"),
                         }],
                         [],          # 空工具列表 = 强制它开口
-                        stop_flag=stop_flag,
+                        stop_flag=stop_flag, cot=self.cot,
                         on_token=lambda t: self.emit({"type": "token", "text": t}),
+                        on_cot=on_cot,
                     )
                     last_usage = usage or last_usage
                     answer = (msg.get("content") or "").strip()
@@ -887,14 +926,10 @@ class ChatSession:
                               f"模型 {model} 在收束时也没有给出回答。"
                               f"建议把问题缩小到具体文件。）")
                 self.history.append({"role": "assistant", "content": answer})
-                self.emit({"type": "done", "answer": answer,
-                           "usage": last_usage, "stopped": False,
-                           "context_tokens": self.context_tokens()})
+                self.emit_done(answer, last_usage, False, cot_parts)
                 return
             if stopped():
-                self.emit({"type": "done", "answer": "（已停止）",
-                           "usage": last_usage, "stopped": True,
-                           "context_tokens": self.context_tokens()})
+                self.emit_done("（已停止）", last_usage, True, cot_parts)
                 return
 
             msgs = self._build_messages()
@@ -903,8 +938,9 @@ class ChatSession:
                 # （非流式时要等整轮写完，实测点了停止还要等 21 秒）
                 msg, usage = call_llm(
                     self.env, self.system, msgs, self.tool_specs,
-                    stop_flag=stop_flag,
+                    stop_flag=stop_flag, cot=self.cot,
                     on_token=lambda t: self.emit({"type": "token", "text": t}),
+                    on_cot=on_cot,
                 )
             except Exception as e:  # noqa: BLE001
                 self.emit({"type": "error", "message": str(e)})
@@ -921,14 +957,11 @@ class ChatSession:
                     # 明确标成 stopped，别让它看起来像一个完整答案。
                     partial = content or "（已停止，未产生回答）"
                     self.history.append({"role": "assistant", "content": partial})
-                    self.emit({"type": "done", "answer": partial, "usage": usage,
-                               "stopped": True,
-                               "context_tokens": self.context_tokens()})
+                    self.emit_done(partial, usage, True, cot_parts)
                     return
                 answer = content or f"（空回答；finish_reason 异常，模型 {model}）"
                 self.history.append({"role": "assistant", "content": answer})
-                self.emit({"type": "done", "answer": answer, "usage": usage,
-                           "context_tokens": self.context_tokens()})
+                self.emit_done(answer, usage, False, cot_parts)
                 return
 
             # 带工具调用的 assistant 消息必须进历史，否则工具结果的
@@ -1002,9 +1035,7 @@ class ChatSession:
             self._sweep()
 
             if stopped():
-                self.emit({"type": "done", "answer": "（已停止）",
-                           "usage": last_usage, "stopped": True,
-                           "context_tokens": self.context_tokens()})
+                self.emit_done("（已停止）", last_usage, True, cot_parts)
                 return
 
     def set_model(self, model: str) -> str:
@@ -1019,6 +1050,45 @@ class ChatSession:
         return self.env.get("ZHIHU_LLM_MODEL") or ""
 
     # ---------------- 上下文解剖 ----------------
+    def context_raw(self) -> list[dict]:
+        """下一轮真正发给 LLM 的 messages 数组，逐条原样返回。
+
+        与 context_breakdown（聚合态）的区别：
+          - breakdown：按语义分段、按 token 降序、带折叠说明——是**给人看的解释**；
+          - 这里：call_llm 实际构造的 payload = [system] + history，按**真实顺序**，
+            含折叠后的占位符、tool_calls、tool_call_id——是**给核对用的原样**。
+
+        两者必须同源：都读 self.history 和 self.system，不能各算一份，
+        否则「原始态」和「聚合态」会对不上账。
+        """
+        out = [{
+            "idx": 0, "role": "system", "content": self.system,
+            "tokens": self.system_tokens,
+        }]
+        for i, m in enumerate(self.history, 1):
+            role = m.get("role") or "?"
+            content = str(m.get("content") or "")
+            item = {"idx": i, "role": role, "content": content,
+                    "tokens": kb.est_tokens(content)}
+            if m.get("tool_calls"):
+                item["tool_calls"] = m["tool_calls"]
+                item["tokens"] += kb.est_tokens(
+                    json.dumps(m["tool_calls"], ensure_ascii=False))
+            if m.get("tool_call_id"):
+                item["tool_call_id"] = m["tool_call_id"]
+            out.append(item)
+
+        # est_tokens 对拼接边界敏感：逐条估的和会比 context_tokens()
+        # 少几个 tok。面板两个视图都必须和真实发送量对上账，否则
+        # 「原始态合计 ≠ 聚合态合计」又会变成面板骗人。把差额摊给最大的那条。
+        target = self.context_tokens() - self.tools_tokens
+        got = sum(m["tokens"] for m in out)
+        if got and target != got:
+            big = max(out, key=lambda m: m["tokens"])
+            big["tokens"] += target - got
+            big["gap_note"] = f"含 {target - got:+d} tok 的估算边界差"
+        return out
+
     def context_breakdown(self) -> dict:
         """把「下一轮真正要发的东西」逐段拆开。
 
@@ -1153,6 +1223,44 @@ class ChatSession:
         self.seen_sigs.clear()
         self.n = 0
 
+    def restore_history(self, history: list[dict]) -> int:
+        """恢复持久化的会话历史（user/assistant/tool 消息）。
+
+        **只恢复 history，不重建 blocks/folded**：那些是这一进程的折叠账本，
+        旧进程的折叠状态不该带过来——恢复后的工具结果都以原文形式在 history
+        里，下一轮重新按 age 折叠即可。
+
+        返回恢复的消息数。调用方负责在 init 后、首条 chat 前调用。
+        """
+        restored = 0
+        for m in history or []:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role not in ("user", "assistant", "tool"):
+                continue
+            item = {"role": role, "content": str(m.get("content") or "")}
+            if role == "assistant" and m.get("reasoning"):
+                item["reasoning"] = str(m["reasoning"])
+            if role == "tool" and m.get("tool_call_id"):
+                item["tool_call_id"] = str(m["tool_call_id"])
+            if role == "assistant" and m.get("tool_calls"):
+                # 工具调用必须原样带回，否则下一轮 tool 结果的 tool_call_id
+                # 找不到对应请求，API 会报 400
+                tcs = []
+                for tc in m["tool_calls"]:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    tcs.append({"id": str(tc.get("id") or ""), "type": "function",
+                                "function": {"name": str(fn.get("name") or ""),
+                                             "arguments": str(fn.get("arguments") or "{}")}})
+                if tcs:
+                    item["tool_calls"] = tcs
+            self.history.append(item)
+            restored += 1
+        return restored
+
 
 # ============================================================ 命令读取
 def _reader(commands, stop_flag) -> None:
@@ -1231,7 +1339,13 @@ def main() -> int:
                     files=cmd.get("files") or [],
                     custom=cmd.get("custom") or [],
                     model=cmd.get("model") or "",
+                    cot=bool(cmd.get("cot")),
                 )
+                # 恢复历史：持久化会话重连时把之前的 user/assistant/tool 消息
+                # 原样带回。必须在 init 之后、首条 chat 之前。
+                n_restored = 0
+                if cmd.get("history"):
+                    n_restored = session.restore_history(cmd["history"])
             except Exception as e:  # noqa: BLE001
                 ChatSession.emit({"type": "error",
                                   "message": f"初始化失败：{e}"})
@@ -1240,11 +1354,14 @@ def main() -> int:
                 "type": "init_ok",
                 "repo": session.repo,
                 "model": session.env.get("ZHIHU_LLM_MODEL"),
+                "cot": session.cot,
+                "history_restored": n_restored,
                 "context_tokens": session.context_tokens(),
                 "system_tokens": session.system_tokens,
                 "tools_tokens": session.tools_tokens,
                 "sections": session.assembler.summary(),
                 "breakdown": session.context_breakdown(),
+                "raw": session.context_raw(),
             })
 
         elif action == "chat":
@@ -1260,6 +1377,15 @@ def main() -> int:
                 continue
             ChatSession.emit({"type": "model_ok",
                               "model": session.set_model(str(cmd.get("model") or ""))})
+
+        elif action == "cot":
+            # 会话已初始化后切换思考链：不改上下文，只翻转后续调用的开关。
+            # 不重建会话，否则历史与折叠账本全丢。
+            if session is None:
+                ChatSession.emit({"type": "cot_ok", "cot": False})
+            else:
+                session.cot = bool(cmd.get("cot"))
+                ChatSession.emit({"type": "cot_ok", "cot": session.cot})
 
         elif action == "reset":
             if session is not None:
@@ -1277,7 +1403,19 @@ def main() -> int:
                               "total_tokens": session.context_tokens(),
                               # breakdown 是「真正要发出去的 payload 解剖」，
                               # 前端上下文面板用它；sections 保留给老调用方
-                              "breakdown": session.context_breakdown()})
+                              "breakdown": session.context_breakdown(),
+                              # raw 是逐条原样的 messages 数组，供「原始态」展示
+                              "raw": session.context_raw()})
+
+        elif action == "history":
+            # 给持久化用：导出当前 LLM history（含 tool_call_id），
+            # 前端在每轮 done 后拉取并随会话一起落盘。恢复时原样灌回，
+            # 否则 assistant 的 tool_calls 和 tool 结果对不上号，下一轮 API 会 400。
+            if session is None:
+                ChatSession.emit({"type": "history", "history": []})
+            else:
+                ChatSession.emit({"type": "history",
+                                  "history": [dict(m) for m in session.history]})
 
         elif action == "ping":
             ChatSession.emit({"type": "pong"})

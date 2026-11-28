@@ -1184,15 +1184,53 @@ class Block:
         self.tokens = est_tokens(self.text)
 
 
+def registered_projects(root: Path) -> dict[str, Path]:
+    """项目注册表：仓库名 → 源码磁盘根。
+
+    读 `projects` 表（由 `projtree projects add` 写入）。
+    与 `repo_roots` 分开是因为用途不同：
+      - 这里只报**用户明确登记过**的项目；
+      - repo_roots 还要兜底发现老库里的项目。
+    库不存在或缺表时返回空字典，绝不抛错——kb 的其它命令不该因为
+    没跑过 projtree 就崩掉。
+    """
+    import sqlite3
+    db = index_db_path(root)
+    if not db.exists():
+        return {}
+    out: dict[str, Path] = {}
+    try:
+        conn = sqlite3.connect(str(db))
+        try:
+            for name, disk in conn.execute(
+                    "SELECT name, disk_path FROM projects"):
+                p = Path(str(disk))
+                if p.is_dir():
+                    out[str(name)] = p
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+    return out
+
+
 def repo_roots(root: Path) -> dict[str, Path]:
     """仓库名 → 磁盘根。
 
-    优先取仓库页面 frontmatter 的 `root:`；没写的退回「知识库根的兄弟目录」，
-    因为 infohub / codeb 恰好放在那里。两者都不成立时不猜——让 pack 直接报
-    「源码不可读」，而不是装订出一份没有源码却看着很完整的册子。
+    优先级：
+      0. `projects` 注册表——用户导入的项目（可能是任意路径，两条旧规则都覆盖不到）
+      1. 仓库页面 frontmatter 的 `root:`
+      2. 知识库根的兄弟目录
+    都不成立时不猜——让 pack 直接报「源码不可读」，而不是装订出一份
+    没有源码却看着很完整的册子。
     """
     base = Path(root).resolve()
     out: dict[str, Path] = {}
+
+    # 0) 注册表优先：导入的项目放哪都得能用
+    for name, disk in registered_projects(root).items():
+        out.setdefault(name, disk)
+
     for pg in all_pages(root):
         if pg.disk:
             out.setdefault(pg.repo, Path(pg.disk))
